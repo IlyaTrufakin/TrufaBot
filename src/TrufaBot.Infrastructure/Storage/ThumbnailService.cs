@@ -1,5 +1,4 @@
-﻿using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Processing;
+﻿using SkiaSharp;
 using TrufaBot.Infrastructure.Common;
 
 namespace TrufaBot.Infrastructure.Storage;
@@ -24,20 +23,38 @@ public class ThumbnailService : IThumbnailService
             return thumbPath;
         }
 
-        try
+        return await Task.Run(() =>
         {
-            using var image = await Image.LoadAsync(originalPath);
-            image.Mutate(x => x.Resize(new ResizeOptions
+            try
             {
-                Size = new Size(width, height),
-                Mode = ResizeMode.Max
-            }));
-            await image.SaveAsJpegAsync(thumbPath);
-            return thumbPath;
-        }
-        catch
-        {
-            return originalPath;
-        }
+                using var codec = SKCodec.Create(originalPath);
+                if (codec == null) return originalPath;
+
+                var origInfo = codec.Info;
+                float scale = Math.Min((float)width / origInfo.Width, (float)height / origInfo.Height);
+                if (scale >= 1.0f) scale = 1.0f;
+
+                int targetW = Math.Max(1, (int)(origInfo.Width * scale));
+                int targetH = Math.Max(1, (int)(origInfo.Height * scale));
+
+                using var originalBitmap = SKBitmap.Decode(codec);
+                if (originalBitmap == null) return originalPath;
+
+                var imageInfo = new SKImageInfo(targetW, targetH, SKColorType.Rgba8888, SKAlphaType.Premul);
+                using var resizedBitmap = originalBitmap.Resize(imageInfo, SKFilterQuality.Medium);
+                if (resizedBitmap == null) return originalPath;
+
+                using var image = SKImage.FromBitmap(resizedBitmap);
+                using var data = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+                using var stream = File.OpenWrite(thumbPath);
+                data.SaveTo(stream);
+
+                return thumbPath;
+            }
+            catch
+            {
+                return originalPath;
+            }
+        });
     }
 }
