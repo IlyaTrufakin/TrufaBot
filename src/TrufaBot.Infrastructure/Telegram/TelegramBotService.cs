@@ -26,6 +26,8 @@ public class UserBrowseState
 
 public class TelegramBotService
 {
+    private const long MaxTelegramUploadBytes = 49 * 1024 * 1024;
+
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic"
@@ -111,6 +113,24 @@ public class TelegramBotService
         return parts.Any(p => IgnoredDirectories.Contains(p) || p.StartsWith("@") || p.StartsWith("$") || (p.StartsWith(".") && p.Length > 1));
     }
 
+    private async Task SafeEditMessageTextAsync(ITelegramBotClient bot, long chatId, int messageId, string text, InlineKeyboardMarkup replyMarkup, CancellationToken ct)
+    {
+        try
+        {
+            await bot.EditMessageTextAsync(
+                chatId,
+                messageId,
+                text,
+                parseMode: ParseMode.Html,
+                replyMarkup: replyMarkup,
+                cancellationToken: ct
+            );
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+        {
+        }
+    }
+
     private async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
     {
         try
@@ -183,7 +203,6 @@ public class TelegramBotService
             cancellationToken: ct
         );
 
-        // Отправляем постоянную нижнюю клавиатуру
         await bot.SendTextMessageAsync(
             chatId,
             "👇 Кнопки быстрого доступа всегда под рукой:",
@@ -213,14 +232,7 @@ public class TelegramBotService
 
         if (editMessageId.HasValue)
         {
-            await bot.EditMessageTextAsync(
-                chatId,
-                editMessageId.Value,
-                messageText,
-                parseMode: ParseMode.Html,
-                replyMarkup: new InlineKeyboardMarkup(buttons),
-                cancellationToken: ct
-            );
+            await SafeEditMessageTextAsync(bot, chatId, editMessageId.Value, messageText, new InlineKeyboardMarkup(buttons), ct);
         }
         else
         {
@@ -381,6 +393,18 @@ public class TelegramBotService
                     var fullPath = Path.Combine(item.StorageSource.RootPath, item.RelativePath.Replace('/', '\\'));
                     if (System.IO.File.Exists(fullPath))
                     {
+                        if (item.FileSize > MaxTelegramUploadBytes)
+                        {
+                            await bot.SendTextMessageAsync(
+                                chatId,
+                                $"⚠️ <b>Файл слишком большой:</b> {item.FileName}\n" +
+                                $"💾 Размер: <b>{item.FileSize / (1024 * 1024.0):F1} МБ</b> (лимит Telegram Bot API — 50 МБ).",
+                                parseMode: ParseMode.Html,
+                                cancellationToken: ct
+                            );
+                            return;
+                        }
+
                         _logger.Log("Info", "Telegram", $"Отправка оригинала: {item.FileName} для @{user.DisplayName}", user.DisplayName);
                         await using var stream = System.IO.File.OpenRead(fullPath);
                         await bot.SendDocumentAsync(
@@ -401,7 +425,7 @@ public class TelegramBotService
         if (source == null || !Directory.Exists(source.RootPath))
         {
             if (messageId.HasValue)
-                await bot.EditMessageTextAsync(chatId, messageId.Value, "Хранилище временно недоступно.", cancellationToken: ct);
+                await SafeEditMessageTextAsync(bot, chatId, messageId.Value, "Хранилище временно недоступно.", new InlineKeyboardMarkup(new InlineKeyboardButton[0]), ct);
             else
                 await bot.SendTextMessageAsync(chatId, "Хранилище временно недоступно.", cancellationToken: ct);
             return;
@@ -417,14 +441,12 @@ public class TelegramBotService
             fullTargetDir = source.RootPath;
         }
 
-        // Подпапки
         state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
             .Where(rel => !IsIgnoredPath(rel) && _authService.CanViewFolder(user, state.SourceId, rel))
             .OrderBy(d => d)
             .ToList();
 
-        // Файлы
         var normalizedFolder = state.FolderPath.Trim('/');
         var allFolderFiles = await db.MediaItems
             .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
@@ -443,7 +465,6 @@ public class TelegramBotService
 
         var keyboardRows = new List<InlineKeyboardButton[]>();
 
-        // Быстрые действия вверху
         var quickActions = new List<InlineKeyboardButton>();
         bool hasImages = state.CachedFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
         if (hasImages)
@@ -456,7 +477,6 @@ public class TelegramBotService
             keyboardRows.Add(quickActions.ToArray());
         }
 
-        // --- СПИСОК ПОДПАПОК (По 6 на страницу) ---
         const int dirPageSize = 6;
         int totalDirs = state.CachedSubDirs.Count;
         int totalDirPages = (int)Math.Ceiling(totalDirs / (double)dirPageSize);
@@ -482,7 +502,6 @@ public class TelegramBotService
             keyboardRows.Add(dirNav.ToArray());
         }
 
-        // --- СПИСОК ФАЙЛОВ (По 5 на страницу) ---
         const int filePageSize = 5;
         int totalFiles = state.CachedFiles.Count;
         int totalFilePages = (int)Math.Ceiling(totalFiles / (double)filePageSize);
@@ -509,7 +528,6 @@ public class TelegramBotService
             keyboardRows.Add(fileNav.ToArray());
         }
 
-        // Навигация вверх / к источникам
         if (!string.IsNullOrEmpty(state.FolderPath))
         {
             keyboardRows.Add(new[]
@@ -529,14 +547,7 @@ public class TelegramBotService
 
         if (messageId.HasValue)
         {
-            await bot.EditMessageTextAsync(
-                chatId,
-                messageId.Value,
-                messageText,
-                parseMode: ParseMode.Html,
-                replyMarkup: new InlineKeyboardMarkup(keyboardRows),
-                cancellationToken: ct
-            );
+            await SafeEditMessageTextAsync(bot, chatId, messageId.Value, messageText, new InlineKeyboardMarkup(keyboardRows), ct);
         }
         else
         {
@@ -599,7 +610,6 @@ public class TelegramBotService
             {
                 await bot.SendMediaGroupAsync(chatId, mediaList, cancellationToken: ct);
 
-                // После отправки альбома выводим меню навигации
                 var albumNavKeyboard = new InlineKeyboardMarkup(new[]
                 {
                     new[]
@@ -642,7 +652,6 @@ public class TelegramBotService
 
         var ext = item.FileExtension.ToLowerInvariant();
 
-        // Меню управления прямо под отправленным фото
         var keyboard = new InlineKeyboardMarkup(new[]
         {
             new[]
@@ -673,28 +682,32 @@ public class TelegramBotService
         }
         else if (VideoExtensions.Contains(ext))
         {
+            if (item.FileSize > MaxTelegramUploadBytes)
+            {
+                _logger.Log("Warning", "Telegram", $"Видео '{item.FileName}' ({item.FileSize / (1024 * 1024.0):F1} МБ) превышает лимит Telegram (50 МБ).", user.DisplayName);
+                await bot.SendTextMessageAsync(
+                    chatId,
+                    $"⚠️ <b>Видео слишком большое для отправки в Telegram:</b>\n" +
+                    $"🎬 <code>{item.FileName}</code>\n" +
+                    $"💾 Размер: <b>{item.FileSize / (1024 * 1024.0):F1} МБ</b> (лимит Telegram Bot API — 50 МБ).\n" +
+                    $"<i>Рекомендуется просмотреть это видео напрямую с домашнего NAS.</i>",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: keyboard,
+                    cancellationToken: ct
+                );
+                return;
+            }
+
             _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
             await using var stream = System.IO.File.OpenRead(fullPath);
-            if (item.FileSize < 50 * 1024 * 1024)
-            {
-                await bot.SendVideoAsync(
-                    chatId,
-                    InputFile.FromStream(stream, item.FileName),
-                    caption: $"🎬 {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
-                    replyMarkup: keyboard,
-                    cancellationToken: ct
-                );
-            }
-            else
-            {
-                await bot.SendDocumentAsync(
-                    chatId,
-                    InputFile.FromStream(stream, item.FileName),
-                    caption: $"🎬 {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
-                    replyMarkup: keyboard,
-                    cancellationToken: ct
-                );
-            }
+            await bot.SendVideoAsync(
+                chatId,
+                InputFile.FromStream(stream, item.FileName),
+                caption: $"🎬 <b>{item.FileName}</b> ({item.FileSize / (1024 * 1024.0):F1} МБ)",
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: ct
+            );
         }
     }
 
@@ -734,7 +747,10 @@ public class TelegramBotService
             ? $"Telegram API Error [{apiEx.ErrorCode}]: {apiEx.Message}"
             : exception.Message;
 
-        _logger.Log("Error", "Telegram", errorMsg);
+        if (!errorMsg.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Log("Error", "Telegram", errorMsg);
+        }
         return Task.CompletedTask;
     }
 }
