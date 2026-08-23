@@ -557,19 +557,42 @@ public class TelegramBotService
 
         var pagePhotos = allPhotos.Skip(state.FilePage * FilePageSize).Take(FilePageSize).ToList();
 
-        _logger.Log("Info", "Telegram", $"Генерация галереи из {pagePhotos.Count} миниатюр (Стр. {state.FilePage + 1}/{totalPhotoPages}) для @{user.DisplayName}", user.DisplayName);
+        _logger.Log("Info", "Telegram", $"Параллельная генерация {pagePhotos.Count} миниатюр (Стр. {state.FilePage + 1}/{totalPhotoPages}) для @{user.DisplayName}", user.DisplayName);
 
-        var batch1 = pagePhotos.Take(10).ToList();
-        var batch2 = pagePhotos.Skip(10).Take(10).ToList();
+        // 1. Быстрая параллельная генерация всех миниатюр на всех ядрах процессора
+        var thumbTasks = pagePhotos.Select(async img =>
+        {
+            var origPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
+            if (File.Exists(origPath))
+            {
+                var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(origPath, 600, 600);
+                return (Item: img, ThumbPath: thumbPath);
+            }
+            return (Item: img, ThumbPath: string.Empty);
+        }).ToList();
 
-        await SendMediaBatchAsync(bot, chatId, source, batch1, ct);
+        var readyThumbs = (await Task.WhenAll(thumbTasks))
+            .Where(t => !string.IsNullOrEmpty(t.ThumbPath))
+            .ToList();
+
+        // 2. Telegram MediaGroup принимает максимум 10 фото на одну группу.
+        // Отправляем оба батча (до 10 + до 10) ПАРАЛЛЕЛЬНО без паузы!
+        var batch1 = readyThumbs.Take(10).ToList();
+        var batch2 = readyThumbs.Skip(10).Take(10).ToList();
+
+        var uploadTasks = new List<Task>();
+        uploadTasks.Add(SendMediaGroupBatchAsync(bot, chatId, batch1, ct));
         if (batch2.Any())
         {
-            await SendMediaBatchAsync(bot, chatId, source, batch2, ct);
+            uploadTasks.Add(SendMediaGroupBatchAsync(bot, chatId, batch2, ct));
         }
 
+        await Task.WhenAll(uploadTasks);
+
+        // 3. Клавиатура навигации
         var navButtons = new List<InlineKeyboardButton[]>();
 
+        // Если в этой папке также есть подпапки, выводим их
         if (state.CachedSubDirs.Any())
         {
             for (int i = 0; i < Math.Min(state.CachedSubDirs.Count, 6); i += 2)
@@ -584,6 +607,7 @@ public class TelegramBotService
             }
         }
 
+        // Строка пагинации фото
         var pageRow = new List<InlineKeyboardButton>();
         if (state.FilePage > 0)
         {
@@ -596,6 +620,7 @@ public class TelegramBotService
         }
         navButtons.Add(pageRow.ToArray());
 
+        // Навигация
         navButtons.Add(new[]
         {
             InlineKeyboardButton.WithCallbackData("⬆️ Вверх", "nav_up"),
@@ -608,7 +633,7 @@ public class TelegramBotService
         });
 
         int startItemIndex = state.FilePage * FilePageSize + 1;
-        int endItemIndex = state.FilePage * FilePageSize + pagePhotos.Count;
+        int endItemIndex = state.FilePage * FilePageSize + readyThumbs.Count;
         var folderTitle = string.IsNullOrEmpty(state.FolderPath) ? source.Name : Path.GetFileName(state.FolderPath);
         var captionText = $"📁 <b>{folderTitle}</b> | Фото {startItemIndex}–{endItemIndex} из {totalPhotos}\n" +
                           $"<i>(Стр. {state.FilePage + 1} из {totalPhotoPages})</i>";
@@ -622,36 +647,28 @@ public class TelegramBotService
         );
     }
 
-    private async Task SendMediaBatchAsync(ITelegramBotClient bot, long chatId, StorageSource source, List<MediaItem> items, CancellationToken ct)
+    private async Task SendMediaGroupBatchAsync(ITelegramBotClient bot, long chatId, List<(MediaItem Item, string ThumbPath)> batch, CancellationToken ct)
     {
-        if (!items.Any()) return;
+        if (!batch.Any()) return;
 
         var mediaList = new List<IAlbumInputMedia>();
         var openStreams = new List<FileStream>();
 
         try
         {
-            foreach (var img in items)
+            foreach (var item in batch)
             {
-                var originalPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
-                if (File.Exists(originalPath))
+                var stream = File.OpenRead(item.ThumbPath);
+                openStreams.Add(stream);
+
+                var inputPhoto = new InputMediaPhoto(InputFile.FromStream(stream, item.Item.FileName))
                 {
-                    var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(originalPath, 600, 600);
-                    var stream = File.OpenRead(thumbPath);
-                    openStreams.Add(stream);
-
-                    var inputPhoto = new InputMediaPhoto(InputFile.FromStream(stream, img.FileName))
-                    {
-                        Caption = img.FileName
-                    };
-                    mediaList.Add(inputPhoto);
-                }
+                    Caption = item.Item.FileName
+                };
+                mediaList.Add(inputPhoto);
             }
 
-            if (mediaList.Any())
-            {
-                await bot.SendMediaGroup(chatId, mediaList, cancellationToken: ct);
-            }
+            await bot.SendMediaGroup(chatId, mediaList, cancellationToken: ct);
         }
         finally
         {
