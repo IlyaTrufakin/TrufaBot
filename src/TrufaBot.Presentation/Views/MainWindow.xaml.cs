@@ -78,12 +78,6 @@ public partial class MainWindow : Window
             // Отменяем закрытие и скрываем окно в системный трей (возле часов)
             e.Cancel = true;
             Hide();
-
-            _trayIcon?.ShowNotification(
-                title: "TrufaBot продолжает работать",
-                message: "Сервер свернут в системный трей и обрабатывает запросы Telegram в фоновом режиме.",
-                icon: NotificationIcon.Info
-            );
         }
         else
         {
