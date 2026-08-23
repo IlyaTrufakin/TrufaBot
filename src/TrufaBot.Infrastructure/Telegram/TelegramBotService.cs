@@ -76,6 +76,13 @@ public class TelegramBotService
             _cts.Token
         );
 
+        _ = _botClient.SetMyCommandsAsync(new[]
+        {
+            new BotCommand { Command = "start", Description = "🏠 Главное меню" },
+            new BotCommand { Command = "browse", Description = "📁 Проводник папок" },
+            new BotCommand { Command = "random", Description = "🎲 Случайное фото" }
+        });
+
         _logger.Log("Info", "Telegram", "Telegram бот успешно запущен и слушает запросы.");
     }
 
@@ -84,6 +91,18 @@ public class TelegramBotService
         _cts?.Cancel();
         _botClient = null;
         _logger.Log("Info", "Telegram", "Telegram бот остановлен.");
+    }
+
+    private static ReplyKeyboardMarkup GetPersistentMenuKeyboard()
+    {
+        return new ReplyKeyboardMarkup(new[]
+        {
+            new KeyboardButton[] { "📁 Проводник архива", "🎲 Случайное фото" }
+        })
+        {
+            ResizeKeyboard = true,
+            IsPersistent = true
+        };
     }
 
     private static bool IsIgnoredPath(string path)
@@ -114,7 +133,7 @@ public class TelegramBotService
                 return;
             }
 
-            if (update.Type == UpdateType.Message && update.Message?.Text != null)
+            if (update.Type == UpdateType.Message && update.Message != null)
             {
                 await HandleTextMessageAsync(bot, update.Message, user, db, ct);
             }
@@ -133,19 +152,83 @@ public class TelegramBotService
     {
         var text = message.Text?.Trim() ?? "";
 
-        if (text.StartsWith("/start"))
+        if (text.Equals("🎲 Случайное фото", StringComparison.OrdinalIgnoreCase) || text.Equals("/random", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.Log("Info", "Telegram", $"Пользователь @{user.Username ?? user.DisplayName} открыл главное меню.", user.DisplayName);
-            var keyboard = new InlineKeyboardMarkup(new[]
-            {
-                new[] { InlineKeyboardButton.WithCallbackData("📁 Проводник архива", "nav_sources") },
-                new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") }
-            });
+            await SendRandomPhotoAsync(bot, message.Chat.Id, user, db, sourceId: null, folder: null, ct);
+        }
+        else if (text.Equals("📁 Проводник архива", StringComparison.OrdinalIgnoreCase) || text.Equals("/browse", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendSourcesMenuAsync(bot, message.Chat.Id, null, user, db, ct);
+        }
+        else
+        {
+            _logger.Log("Info", "Telegram", $"Пользователь @{user.Username ?? user.DisplayName} открыл меню.", user.DisplayName);
+            await SendMainMenuAsync(bot, message.Chat.Id, user, ct);
+        }
+    }
 
+    private async Task SendMainMenuAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, CancellationToken ct)
+    {
+        var inlineKeyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("📁 Проводник архива", "nav_sources") },
+            new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") }
+        });
+
+        await bot.SendTextMessageAsync(
+            chatId,
+            $"👋 Здравствуйте, <b>{user.DisplayName}</b>!\n\nДобро пожаловать в семейный архив медиафайлов.\nВыберите раздел для просмотра:",
+            parseMode: ParseMode.Html,
+            replyMarkup: inlineKeyboard,
+            cancellationToken: ct
+        );
+
+        // Отправляем постоянную нижнюю клавиатуру
+        await bot.SendTextMessageAsync(
+            chatId,
+            "👇 Кнопки быстрого доступа всегда под рукой:",
+            replyMarkup: GetPersistentMenuKeyboard(),
+            cancellationToken: ct
+        );
+    }
+
+    private async Task SendSourcesMenuAsync(ITelegramBotClient bot, long chatId, int? editMessageId, Domain.Entities.User user, AppDbContext db, CancellationToken ct)
+    {
+        var sources = await db.StorageSources.Where(s => s.IsEnabled).ToListAsync(ct);
+        var buttons = new List<InlineKeyboardButton[]>();
+
+        foreach (var src in sources)
+        {
+            if (_authService.HasAnyAccessToSource(user, src.Id))
+            {
+                buttons.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 {src.Name}", $"select_src_{src.Id}") });
+            }
+        }
+
+        buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото (все диски)", "random_photo") });
+
+        string messageText = buttons.Count > 1 
+            ? "📂 <b>Выберите источник медиафайлов:</b>" 
+            : "Вам пока не назначен доступ ни к одной папке.";
+
+        if (editMessageId.HasValue)
+        {
+            await bot.EditMessageTextAsync(
+                chatId,
+                editMessageId.Value,
+                messageText,
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(buttons),
+                cancellationToken: ct
+            );
+        }
+        else
+        {
             await bot.SendTextMessageAsync(
-                message.Chat.Id,
-                $"👋 Здравствуйте, {user.DisplayName}!\nДобро пожаловать в семейный архив. Выберите действие:",
-                replyMarkup: keyboard,
+                chatId,
+                messageText,
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(buttons),
                 cancellationToken: ct
             );
         }
@@ -159,34 +242,17 @@ public class TelegramBotService
         long chatId = query.Message!.Chat.Id;
         int messageId = query.Message.MessageId;
 
-        if (data == "random_photo")
+        if (data == "nav_main_menu")
+        {
+            await SendMainMenuAsync(bot, chatId, user, ct);
+        }
+        else if (data == "random_photo")
         {
             await SendRandomPhotoAsync(bot, chatId, user, db, sourceId: null, folder: null, ct);
         }
         else if (data == "nav_sources")
         {
-            var sources = await db.StorageSources
-                .Where(s => s.IsEnabled)
-                .ToListAsync(ct);
-
-            var buttons = new List<InlineKeyboardButton[]>();
-            foreach (var src in sources)
-            {
-                if (_authService.HasAnyAccessToSource(user, src.Id))
-                {
-                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 {src.Name}", $"select_src_{src.Id}") });
-                }
-            }
-
-            buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото (все источники)", "random_photo") });
-
-            await bot.EditMessageTextAsync(
-                chatId,
-                messageId,
-                buttons.Count > 1 ? "📂 Выберите источник медиафайлов:" : "Вам пока не назначен доступ ни к одному источнику.",
-                replyMarkup: new InlineKeyboardMarkup(buttons),
-                cancellationToken: ct
-            );
+            await SendSourcesMenuAsync(bot, chatId, messageId, user, db, ct);
         }
         else if (data.StartsWith("select_src_"))
         {
@@ -227,7 +293,7 @@ public class TelegramBotService
                 }
                 else
                 {
-                    await HandleCallbackQueryAsync(bot, new CallbackQuery { From = query.From, Data = "nav_sources", Message = query.Message }, user, db, ct);
+                    await SendSourcesMenuAsync(bot, chatId, messageId, user, db, ct);
                 }
             }
         }
@@ -285,6 +351,26 @@ public class TelegramBotService
                 }
             }
         }
+        else if (data.StartsWith("open_parent_folder_"))
+        {
+            if (long.TryParse(data.Substring("open_parent_folder_".Length), out long mediaId))
+            {
+                var item = await db.MediaItems.FindAsync(new object[] { mediaId }, ct);
+                if (item != null)
+                {
+                    var parentFolder = Path.GetDirectoryName(item.RelativePath)?.Replace('\\', '/') ?? "";
+                    var state = new UserBrowseState
+                    {
+                        SourceId = item.StorageSourceId,
+                        FolderPath = parentFolder,
+                        DirPage = 0,
+                        FilePage = 0
+                    };
+                    _userSessions[userId] = state;
+                    await RenderBrowseViewAsync(bot, chatId, null, user, db, state, ct);
+                }
+            }
+        }
         else if (data.StartsWith("orig_file_"))
         {
             if (long.TryParse(data.Substring("orig_file_".Length), out long mediaId))
@@ -309,12 +395,15 @@ public class TelegramBotService
         }
     }
 
-    private async Task RenderBrowseViewAsync(ITelegramBotClient bot, long chatId, int messageId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
+    private async Task RenderBrowseViewAsync(ITelegramBotClient bot, long chatId, int? messageId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
     {
         var source = await db.StorageSources.FindAsync(new object[] { state.SourceId }, ct);
         if (source == null || !Directory.Exists(source.RootPath))
         {
-            await bot.EditMessageTextAsync(chatId, messageId, "Хранилище временно недоступно.", cancellationToken: ct);
+            if (messageId.HasValue)
+                await bot.EditMessageTextAsync(chatId, messageId.Value, "Хранилище временно недоступно.", cancellationToken: ct);
+            else
+                await bot.SendTextMessageAsync(chatId, "Хранилище временно недоступно.", cancellationToken: ct);
             return;
         }
 
@@ -328,14 +417,14 @@ public class TelegramBotService
             fullTargetDir = source.RootPath;
         }
 
-        // 1. Считываем подпапки (фильтрация прав через CanViewFolder)
+        // Подпапки
         state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
             .Where(rel => !IsIgnoredPath(rel) && _authService.CanViewFolder(user, state.SourceId, rel))
             .OrderBy(d => d)
             .ToList();
 
-        // 2. Считываем файлы в текущей папке (фильтрация прав через CanAccessPath)
+        // Файлы
         var normalizedFolder = state.FolderPath.Trim('/');
         var allFolderFiles = await db.MediaItems
             .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
@@ -367,7 +456,7 @@ public class TelegramBotService
             keyboardRows.Add(quickActions.ToArray());
         }
 
-        // --- СПИСОК ПОДПАПОК (По 6 папок на страницу) ---
+        // --- СПИСОК ПОДПАПОК (По 6 на страницу) ---
         const int dirPageSize = 6;
         int totalDirs = state.CachedSubDirs.Count;
         int totalDirPages = (int)Math.Ceiling(totalDirs / (double)dirPageSize);
@@ -393,7 +482,7 @@ public class TelegramBotService
             keyboardRows.Add(dirNav.ToArray());
         }
 
-        // --- СПИСОК ФАЙЛОВ (По 5 файлов на страницу) ---
+        // --- СПИСОК ФАЙЛОВ (По 5 на страницу) ---
         const int filePageSize = 5;
         int totalFiles = state.CachedFiles.Count;
         int totalFilePages = (int)Math.Ceiling(totalFiles / (double)filePageSize);
@@ -426,7 +515,7 @@ public class TelegramBotService
             keyboardRows.Add(new[]
             {
                 InlineKeyboardButton.WithCallbackData("⬆️ Вверх", "nav_up"),
-                InlineKeyboardButton.WithCallbackData("🏠 В корень источника", "nav_root")
+                InlineKeyboardButton.WithCallbackData("🏠 В корень", "nav_root")
             });
         }
         else
@@ -438,14 +527,27 @@ public class TelegramBotService
         var messageText = $"📁 <b>Папка:</b> {folderTitle}\n" +
                           $"📂 <b>Подпапок:</b> {totalDirs} | 🖼 <b>Файлов:</b> {totalFiles}";
 
-        await bot.EditMessageTextAsync(
-            chatId,
-            messageId,
-            messageText,
-            parseMode: ParseMode.Html,
-            replyMarkup: new InlineKeyboardMarkup(keyboardRows),
-            cancellationToken: ct
-        );
+        if (messageId.HasValue)
+        {
+            await bot.EditMessageTextAsync(
+                chatId,
+                messageId.Value,
+                messageText,
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(keyboardRows),
+                cancellationToken: ct
+            );
+        }
+        else
+        {
+            await bot.SendTextMessageAsync(
+                chatId,
+                messageText,
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(keyboardRows),
+                cancellationToken: ct
+            );
+        }
     }
 
     private async Task SendPreviewAlbumAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
@@ -496,6 +598,28 @@ public class TelegramBotService
             if (mediaList.Any())
             {
                 await bot.SendMediaGroupAsync(chatId, mediaList, cancellationToken: ct);
+
+                // После отправки альбома выводим меню навигации
+                var albumNavKeyboard = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("📁 Открыть эту папку", $"open_parent_folder_{imageFiles.First().Id}"),
+                        InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "rand_current_folder")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu")
+                    }
+                });
+
+                await bot.SendTextMessageAsync(
+                    chatId,
+                    "🖼 <i>Альбом предпросмотра отправлен выше 👆</i>\nВыберите следующее действие:",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: albumNavKeyboard,
+                    cancellationToken: ct
+                );
             }
         }
         finally
@@ -517,9 +641,20 @@ public class TelegramBotService
         if (!System.IO.File.Exists(fullPath)) return;
 
         var ext = item.FileExtension.ToLowerInvariant();
+
+        // Меню управления прямо под отправленным фото
         var keyboard = new InlineKeyboardMarkup(new[]
         {
-            new[] { InlineKeyboardButton.WithCallbackData("📥 Скачать оригинал файла", $"orig_file_{item.Id}") }
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("📥 Оригинал", $"orig_file_{item.Id}"),
+                InlineKeyboardButton.WithCallbackData("🎲 Еще случайное", "rand_current_folder")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("📁 Открыть эту папку", $"open_parent_folder_{item.Id}"),
+                InlineKeyboardButton.WithCallbackData("🏠 Меню", "nav_main_menu")
+            }
         });
 
         if (ImageExtensions.Contains(ext))
@@ -556,6 +691,7 @@ public class TelegramBotService
                     chatId,
                     InputFile.FromStream(stream, item.FileName),
                     caption: $"🎬 {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
+                    replyMarkup: keyboard,
                     cancellationToken: ct
                 );
             }
@@ -589,7 +725,7 @@ public class TelegramBotService
             return;
         }
 
-        await bot.SendTextMessageAsync(chatId, "В этой папке/источнике не найдено доступных фотографий.", cancellationToken: ct);
+        await bot.SendTextMessageAsync(chatId, "В этой папке/источнике не найдено доступных фотографий.", replyMarkup: GetPersistentMenuKeyboard(), cancellationToken: ct);
     }
 
     private Task HandleErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken ct)
