@@ -1,3 +1,4 @@
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SkiaSharp;
 using TrufaBot.Infrastructure.Common;
@@ -16,6 +17,9 @@ public class ThumbnailService : IThumbnailService
         ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".3gp", ".m4v", ".flv", ".mts", ".ts"
     };
 
+    private static string? _cachedFfmpegPath;
+    private static bool _ffmpegChecked;
+
     public async Task<string> GetOrCreateThumbnailAsync(string originalPath, int width = 800, int height = 800)
     {
         if (!File.Exists(originalPath)) return string.Empty;
@@ -24,7 +28,8 @@ public class ThumbnailService : IThumbnailService
         var ext = fileInfo.Extension.ToLowerInvariant();
         var isVideo = VideoExtensions.Contains(ext);
 
-        var thumbFileName = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}_{width}x{height}_v3.jpg";
+        // Версия кэша v4 для генерации реальных кадров видео с кнопкой Play
+        var thumbFileName = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}_{width}x{height}_v4.jpg";
         var thumbPath = Path.Combine(AppPaths.CacheFolder, thumbFileName);
 
         if (File.Exists(thumbPath))
@@ -85,9 +90,9 @@ public class ThumbnailService : IThumbnailService
 
     private static string GenerateVideoThumbnail(string originalPath, string thumbPath, string fileName, int width, int height)
     {
-        SKBitmap? videoFrame = null;
+        SKBitmap? videoFrame = ExtractVideoFrame(originalPath);
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (videoFrame == null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             videoFrame = ExtractWindowsShellThumbnail(originalPath, width, height);
         }
@@ -99,7 +104,7 @@ public class ThumbnailService : IThumbnailService
 
         using (videoFrame)
         {
-            // Масштабируем если нужно
+            // Масштабируем до целевого размера
             float scale = Math.Min((float)width / videoFrame.Width, (float)height / videoFrame.Height);
             int targetW = Math.Max(1, (int)(videoFrame.Width * scale));
             int targetH = Math.Max(1, (int)(videoFrame.Height * scale));
@@ -107,7 +112,7 @@ public class ThumbnailService : IThumbnailService
             var imageInfo = new SKImageInfo(targetW, targetH, SKColorType.Rgba8888, SKAlphaType.Premul);
             using var resizedBitmap = videoFrame.Resize(imageInfo, SKFilterQuality.Medium) ?? videoFrame.Copy();
 
-            // Рисуем стильную полупрозрачную кнопку Play (▶) по центру видео
+            // Рисуем стильную полупрозрачную кнопку Play (▶) поверх реального кадра
             using var surface = SKSurface.Create(new SKImageInfo(resizedBitmap.Width, resizedBitmap.Height));
             var canvas = surface.Canvas;
             canvas.DrawBitmap(resizedBitmap, 0, 0);
@@ -115,9 +120,9 @@ public class ThumbnailService : IThumbnailService
             float cx = resizedBitmap.Width / 2f;
             float cy = resizedBitmap.Height / 2f;
             float radius = Math.Min(resizedBitmap.Width, resizedBitmap.Height) * 0.14f;
-            if (radius < 24) radius = 24;
+            if (radius < 26) radius = 26;
 
-            // Круглая полупрозрачная подложка
+            // Круглая полупрозрачная темная подложка
             using var circlePaint = new SKPaint
             {
                 Color = new SKColor(0, 0, 0, 160),
@@ -152,7 +157,7 @@ public class ThumbnailService : IThumbnailService
             path.Close();
             canvas.DrawPath(path, playPaint);
 
-            // Сохраняем в JPEG
+            // Сохраняем готовый кадр
             using var finalImage = surface.Snapshot();
             using var data = finalImage.Encode(SKEncodedImageFormat.Jpeg, 85);
             using var stream = File.OpenWrite(thumbPath);
@@ -160,6 +165,102 @@ public class ThumbnailService : IThumbnailService
 
             return thumbPath;
         }
+    }
+
+    private static SKBitmap? ExtractVideoFrame(string originalPath)
+    {
+        var ffmpeg = GetFfmpegPath();
+        if (string.IsNullOrEmpty(ffmpeg)) return null;
+
+        var tempFrame = Path.Combine(Path.GetTempPath(), $"trufathumb_{Guid.NewGuid():N}.jpg");
+
+        try
+        {
+            // Берем кадр на 1.0 секунде (чтобы пропустить черные вступительные кадры)
+            var psi = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = $"-ss 00:00:01 -i \"{originalPath}\" -vframes 1 -q:v 2 \"{tempFrame}\" -y",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            };
+
+            using (var proc = Process.Start(psi))
+            {
+                if (proc != null)
+                {
+                    proc.WaitForExit(5000);
+                }
+            }
+
+            if (File.Exists(tempFrame))
+            {
+                return SKBitmap.Decode(tempFrame);
+            }
+        }
+        catch
+        {
+            // Игнорируем ошибки вызова процесса
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempFrame)) File.Delete(tempFrame);
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    private static string? GetFfmpegPath()
+    {
+        if (_ffmpegChecked) return _cachedFfmpegPath;
+
+        // 1. Проверяем PATH
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = "-version",
+                CreateNoWindow = true,
+                UseShellExecute = false
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(1000);
+            if (proc?.ExitCode == 0)
+            {
+                _cachedFfmpegPath = "ffmpeg";
+                _ffmpegChecked = true;
+                return _cachedFfmpegPath;
+            }
+        }
+        catch { }
+
+        // 2. Проверяем стандартные пути WinGet и системы
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WinGet\Links\ffmpeg.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"ffmpeg\bin\ffmpeg.exe"),
+            @"C:\ffmpeg\bin\ffmpeg.exe"
+        };
+
+        foreach (var path in candidates)
+        {
+            if (File.Exists(path))
+            {
+                _cachedFfmpegPath = path;
+                _ffmpegChecked = true;
+                return _cachedFfmpegPath;
+            }
+        }
+
+        _ffmpegChecked = true;
+        return null;
     }
 
     private static string GenerateFallbackVideoCard(string thumbPath, string fileName, int width, int height)
@@ -170,7 +271,6 @@ public class ThumbnailService : IThumbnailService
         using var surface = SKSurface.Create(new SKImageInfo(w, h));
         var canvas = surface.Canvas;
 
-        // Темный градиентный фон
         using var bgPaint = new SKPaint
         {
             Shader = SKShader.CreateLinearGradient(
@@ -187,13 +287,12 @@ public class ThumbnailService : IThumbnailService
 
         using var circlePaint = new SKPaint
         {
-            Color = new SKColor(220, 53, 69, 220), // Стильный рубиновый акцент
+            Color = new SKColor(220, 53, 69, 220),
             IsAntialias = true,
             Style = SKPaintStyle.Fill
         };
         canvas.DrawCircle(cx, cy, radius, circlePaint);
 
-        // Белый треугольник Play
         using var playPaint = new SKPaint
         {
             Color = SKColors.White,
@@ -207,7 +306,6 @@ public class ThumbnailService : IThumbnailService
         path.Close();
         canvas.DrawPath(path, playPaint);
 
-        // Текст названия файла
         using var textPaint = new SKPaint
         {
             Color = SKColors.White,
@@ -230,12 +328,17 @@ public class ThumbnailService : IThumbnailService
     {
         try
         {
-            var uuid = new Guid("bcc18b79-ba16-442f-80c4-8a140df4605f"); // IShellItemImageFactory
-            int hr = SHCreateItemFromParsingName(filePath, IntPtr.Zero, ref uuid, out var factory);
-            if (hr != 0 || factory == null) return null;
+            var uuid = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"); // IShellItem
+            int hr = SHCreateItemFromParsingName(filePath, IntPtr.Zero, ref uuid, out var shellItem);
+            if (hr != 0 || shellItem == null) return null;
 
-            var size = new SIZE(width, height);
-            hr = factory.GetImage(size, SIIGBF.SIIGBF_RESIZETOFIT | SIIGBF.SIIGBF_BIGGERSIZEOK, out var hBitmap);
+            var bhidThumbnail = new Guid("7b0e45f2-e526-47b2-ac61-19d45676e0ac"); // BHID_ThumbnailHandler
+            var iidThumbnailProvider = new Guid("e357fccd-a995-4576-b01f-234630154e96"); // IThumbnailProvider
+
+            hr = shellItem.BindToHandler(IntPtr.Zero, ref bhidThumbnail, ref iidThumbnailProvider, out var providerObj);
+            if (hr != 0 || providerObj is not IThumbnailProvider provider) return null;
+
+            hr = provider.GetThumbnail((uint)width, out var hBitmap, out _);
             if (hr != 0 || hBitmap == IntPtr.Zero) return null;
 
             try
@@ -323,35 +426,21 @@ public class ThumbnailService : IThumbnailService
     }
 
     #region Win32 P/Invoke
-    [ComImport]
-    [Guid("bcc18b79-ba16-442f-80c4-8a140df4605f")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface IShellItemImageFactory
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem
+    {
+        int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppv);
+        int GetParent(out IShellItem ppsi);
+        int GetDisplayName(uint sigdnName, out IntPtr ppszName);
+        int GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        int Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    [ComImport, Guid("e357fccd-a995-4576-b01f-234630154e96"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IThumbnailProvider
     {
         [PreserveSig]
-        int GetImage(
-            [In, MarshalAs(UnmanagedType.Struct)] SIZE size,
-            [In] SIIGBF flags,
-            [Out] out IntPtr phbm);
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SIZE
-    {
-        public int cx;
-        public int cy;
-        public SIZE(int cx, int cy) { this.cx = cx; this.cy = cy; }
-    }
-
-    [Flags]
-    private enum SIIGBF
-    {
-        SIIGBF_RESIZETOFIT = 0x00,
-        SIIGBF_BIGGERSIZEOK = 0x01,
-        SIIGBF_MEMORYONLY = 0x02,
-        SIIGBF_ICONONLY = 0x04,
-        SIIGBF_THUMBNAILONLY = 0x08,
-        SIIGBF_INCACHEONLY = 0x10
+        int GetThumbnail(uint cx, out IntPtr phbmp, out uint pdwAlpha);
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -359,7 +448,7 @@ public class ThumbnailService : IThumbnailService
         [MarshalAs(UnmanagedType.LPWStr)] string path,
         IntPtr pbc,
         ref Guid riid,
-        [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory ppv);
+        [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
 
     [DllImport("gdi32.dll", SetLastError = true)]
     private static extern bool DeleteObject(IntPtr hObject);
