@@ -1,0 +1,19 @@
+﻿## Visual Studio & .NET
+.vs/
+[Bb]in/
+[Dd]ebug/
+[Rr]elease/
+obj/
+*.user
+*.suo
+
+## ользовательские секреты и данные
+*.db
+*.db-shm
+*.db-wal
+config.json
+appsettings.Local.json
+*.log
+logs/
+cache/
+thumbnails/
