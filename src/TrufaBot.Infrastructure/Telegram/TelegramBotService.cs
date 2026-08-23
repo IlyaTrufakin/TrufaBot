@@ -78,12 +78,12 @@ public class TelegramBotService
             _cts.Token
         );
 
-        _ = _botClient.SetMyCommandsAsync(new[]
+        _ = _botClient.SetMyCommands(new[]
         {
             new BotCommand { Command = "start", Description = "🏠 Главное меню" },
             new BotCommand { Command = "browse", Description = "📁 Проводник папок" },
             new BotCommand { Command = "random", Description = "🎲 Случайное фото" }
-        });
+        }, cancellationToken: _cts.Token);
 
         _logger.Log("Info", "Telegram", "Telegram бот успешно запущен и слушает запросы.");
     }
@@ -117,7 +117,7 @@ public class TelegramBotService
     {
         try
         {
-            await bot.EditMessageTextAsync(
+            await bot.EditMessageText(
                 chatId,
                 messageId,
                 text,
@@ -148,7 +148,7 @@ public class TelegramBotService
                 _logger.Log("Warning", "Security", $"Отказ в доступе. Неавторизованный пользователь: @{username} (ID: {userId})");
                 if (update.Message != null)
                 {
-                    await bot.SendTextMessageAsync(update.Message.Chat.Id, "⛔ У вас нет доступа к этому медиа-серверу.", cancellationToken: ct);
+                    await bot.SendMessage(update.Message.Chat.Id, "⛔ У вас нет доступа к этому медиа-серверу.", cancellationToken: ct);
                 }
                 return;
             }
@@ -195,7 +195,7 @@ public class TelegramBotService
             new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") }
         });
 
-        await bot.SendTextMessageAsync(
+        await bot.SendMessage(
             chatId,
             $"👋 Здравствуйте, <b>{user.DisplayName}</b>!\n\nДобро пожаловать в семейный архив медиафайлов.\nВыберите раздел для просмотра:",
             parseMode: ParseMode.Html,
@@ -203,7 +203,7 @@ public class TelegramBotService
             cancellationToken: ct
         );
 
-        await bot.SendTextMessageAsync(
+        await bot.SendMessage(
             chatId,
             "👇 Кнопки быстрого доступа всегда под рукой:",
             replyMarkup: GetPersistentMenuKeyboard(),
@@ -236,7 +236,7 @@ public class TelegramBotService
         }
         else
         {
-            await bot.SendTextMessageAsync(
+            await bot.SendMessage(
                 chatId,
                 messageText,
                 parseMode: ParseMode.Html,
@@ -248,7 +248,7 @@ public class TelegramBotService
 
     private async Task HandleCallbackQueryAsync(ITelegramBotClient bot, CallbackQuery query, Domain.Entities.User user, AppDbContext db, CancellationToken ct)
     {
-        await bot.AnswerCallbackQueryAsync(query.Id, cancellationToken: ct);
+        await bot.AnswerCallbackQuery(query.Id, cancellationToken: ct);
         var data = query.Data ?? "";
         long userId = query.From.Id;
         long chatId = query.Message!.Chat.Id;
@@ -395,7 +395,7 @@ public class TelegramBotService
                     {
                         if (item.FileSize > MaxTelegramUploadBytes)
                         {
-                            await bot.SendTextMessageAsync(
+                            await bot.SendMessage(
                                 chatId,
                                 $"⚠️ <b>Файл слишком большой:</b> {item.FileName}\n" +
                                 $"💾 Размер: <b>{item.FileSize / (1024 * 1024.0):F1} МБ</b> (лимит Telegram Bot API — 50 МБ).",
@@ -407,7 +407,7 @@ public class TelegramBotService
 
                         _logger.Log("Info", "Telegram", $"Отправка оригинала: {item.FileName} для @{user.DisplayName}", user.DisplayName);
                         await using var stream = System.IO.File.OpenRead(fullPath);
-                        await bot.SendDocumentAsync(
+                        await bot.SendDocument(
                             chatId,
                             InputFile.FromStream(stream, item.FileName),
                             caption: $"📥 Оригинал: {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
@@ -427,7 +427,7 @@ public class TelegramBotService
             if (messageId.HasValue)
                 await SafeEditMessageTextAsync(bot, chatId, messageId.Value, "Хранилище временно недоступно.", new InlineKeyboardMarkup(new InlineKeyboardButton[0]), ct);
             else
-                await bot.SendTextMessageAsync(chatId, "Хранилище временно недоступно.", cancellationToken: ct);
+                await bot.SendMessage(chatId, "Хранилище временно недоступно.", cancellationToken: ct);
             return;
         }
 
@@ -551,7 +551,7 @@ public class TelegramBotService
         }
         else
         {
-            await bot.SendTextMessageAsync(
+            await bot.SendMessage(
                 chatId,
                 messageText,
                 parseMode: ParseMode.Html,
@@ -579,7 +579,7 @@ public class TelegramBotService
 
         if (!imageFiles.Any())
         {
-            await bot.SendTextMessageAsync(chatId, "В этой папке нет доступных фото для альбома.", cancellationToken: ct);
+            await bot.SendMessage(chatId, "В этой папке нет доступных фото для альбома.", cancellationToken: ct);
             return;
         }
 
@@ -608,7 +608,7 @@ public class TelegramBotService
 
             if (mediaList.Any())
             {
-                await bot.SendMediaGroupAsync(chatId, mediaList, cancellationToken: ct);
+                await bot.SendMediaGroup(chatId, mediaList, cancellationToken: ct);
 
                 var albumNavKeyboard = new InlineKeyboardMarkup(new[]
                 {
@@ -623,7 +623,7 @@ public class TelegramBotService
                     }
                 });
 
-                await bot.SendTextMessageAsync(
+                await bot.SendMessage(
                     chatId,
                     "🖼 <i>Альбом предпросмотра отправлен выше 👆</i>\nВыберите следующее действие:",
                     parseMode: ParseMode.Html,
@@ -671,7 +671,7 @@ public class TelegramBotService
             _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
             var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 1280, 1280);
             await using var stream = System.IO.File.OpenRead(thumbPath);
-            await bot.SendPhotoAsync(
+            await bot.SendPhoto(
                 chatId,
                 InputFile.FromStream(stream, item.FileName),
                 caption: $"🖼 <b>{item.FileName}</b>\n📁 <code>{item.RelativePath}</code>\n💾 Размер: {item.FileSize / (1024 * 1024.0):F1} МБ",
@@ -685,7 +685,7 @@ public class TelegramBotService
             if (item.FileSize > MaxTelegramUploadBytes)
             {
                 _logger.Log("Warning", "Telegram", $"Видео '{item.FileName}' ({item.FileSize / (1024 * 1024.0):F1} МБ) превышает лимит Telegram (50 МБ).", user.DisplayName);
-                await bot.SendTextMessageAsync(
+                await bot.SendMessage(
                     chatId,
                     $"⚠️ <b>Видео слишком большое для отправки в Telegram:</b>\n" +
                     $"🎬 <code>{item.FileName}</code>\n" +
@@ -700,7 +700,7 @@ public class TelegramBotService
 
             _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
             await using var stream = System.IO.File.OpenRead(fullPath);
-            await bot.SendVideoAsync(
+            await bot.SendVideo(
                 chatId,
                 InputFile.FromStream(stream, item.FileName),
                 caption: $"🎬 <b>{item.FileName}</b> ({item.FileSize / (1024 * 1024.0):F1} МБ)",
@@ -738,7 +738,7 @@ public class TelegramBotService
             return;
         }
 
-        await bot.SendTextMessageAsync(chatId, "В этой папке/источнике не найдено доступных фотографий.", replyMarkup: GetPersistentMenuKeyboard(), cancellationToken: ct);
+        await bot.SendMessage(chatId, "В этой папке/источнике не найдено доступных фотографий.", replyMarkup: GetPersistentMenuKeyboard(), cancellationToken: ct);
     }
 
     private Task HandleErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken ct)

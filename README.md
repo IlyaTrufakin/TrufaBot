@@ -11,11 +11,6 @@
 
 ---
 
-## 📌 Repository Description (for GitHub About section)
-> **Private self-hosted Windows home media server with an interactive Telegram bot, granular family folder permissions, background system tray service, and scheduled local AI photo classification.**
-
----
-
 <p align="center">
   <a href="#-english"><b>English</b></a> •
   <a href="#-українська"><b>Українська</b></a>

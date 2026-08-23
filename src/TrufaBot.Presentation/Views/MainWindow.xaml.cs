@@ -1,8 +1,7 @@
 ﻿using System.ComponentModel;
 using System.Drawing;
 using System.Windows;
-using System.Windows.Controls;
-using H.NotifyIcon;
+using Forms = System.Windows.Forms;
 using TrufaBot.Presentation.ViewModels;
 
 namespace TrufaBot.Presentation.Views;
@@ -10,7 +9,7 @@ namespace TrufaBot.Presentation.Views;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
-    private TaskbarIcon? _trayIcon;
+    private Forms.NotifyIcon? _trayIcon;
     private bool _isExplicitExit = false;
 
     public MainWindow(MainViewModel viewModel)
@@ -26,33 +25,30 @@ public partial class MainWindow : Window
     {
         try
         {
-            _trayIcon = new TaskbarIcon
+            _trayIcon = new Forms.NotifyIcon
             {
-                ToolTipText = "TrufaBot — Домашний медиа-сервер",
-                Icon = SystemIcons.Application
+                Text = "TrufaBot — Домашний медиа-сервер",
+                Icon = SystemIcons.Application,
+                Visible = true
             };
 
-            // Двойной клик по иконке в трее открывает окно
-            _trayIcon.TrayMouseDoubleClick += (s, e) => ShowMainWindow();
+            // Двойной клик или одинарный клик по иконке в трее открывает окно
+            _trayIcon.DoubleClick += (s, e) => ShowMainWindow();
 
             // Контекстное меню по правому клику в трее
-            var contextMenu = new ContextMenu();
+            var contextMenu = new Forms.ContextMenuStrip();
 
-            var openItem = new MenuItem { Header = "🖥 Открыть окно" };
-            openItem.Click += (s, e) => ShowMainWindow();
-            contextMenu.Items.Add(openItem);
+            contextMenu.Items.Add("🖥 Открыть окно", null, (s, e) => ShowMainWindow());
+            contextMenu.Items.Add("▶ Запустить / Остановить бота", null, (s, e) => _viewModel.ToggleBotCommand.Execute(null));
+            contextMenu.Items.Add(new Forms.ToolStripSeparator());
 
-            var toggleBotItem = new MenuItem { Header = "▶ Запустить / Остановить бота" };
-            toggleBotItem.Click += (s, e) => _viewModel.ToggleBotCommand.Execute(null);
-            contextMenu.Items.Add(toggleBotItem);
+            var exitItem = contextMenu.Items.Add("🚪 Полный выход", null, (s, e) => ExitApplication());
+            if (exitItem.Font != null)
+            {
+                exitItem.Font = new System.Drawing.Font(exitItem.Font, System.Drawing.FontStyle.Bold);
+            }
 
-            contextMenu.Items.Add(new Separator());
-
-            var exitItem = new MenuItem { Header = "🚪 Полный выход", FontWeight = FontWeights.Bold };
-            exitItem.Click += (s, e) => ExitApplication();
-            contextMenu.Items.Add(exitItem);
-
-            _trayIcon.ContextMenu = contextMenu;
+            _trayIcon.ContextMenuStrip = contextMenu;
         }
         catch { }
     }
@@ -67,7 +63,11 @@ public partial class MainWindow : Window
     private void ExitApplication()
     {
         _isExplicitExit = true;
-        _trayIcon?.Dispose();
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.Dispose();
+        }
         System.Windows.Application.Current.Shutdown();
     }
 
@@ -78,10 +78,21 @@ public partial class MainWindow : Window
             // Отменяем закрытие и скрываем окно в системный трей (возле часов)
             e.Cancel = true;
             Hide();
+
+            _trayIcon?.ShowBalloonTip(
+                2000,
+                "TrufaBot продолжает работать",
+                "Сервер свернут в системный трей и обрабатывает запросы Telegram в фоновом режиме.",
+                Forms.ToolTipIcon.Info
+            );
         }
         else
         {
-            _trayIcon?.Dispose();
+            if (_trayIcon != null)
+            {
+                _trayIcon.Visible = false;
+                _trayIcon.Dispose();
+            }
             base.OnClosing(e);
         }
     }
