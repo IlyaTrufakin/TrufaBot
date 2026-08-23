@@ -15,6 +15,16 @@ namespace TrufaBot.Infrastructure.Telegram;
 
 public class TelegramBotService
 {
+    private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic"
+    };
+
+    private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".mp4", ".mov", ".avi", ".mkv", ".webm"
+    };
+
     private readonly IAuditLogger _logger;
     private readonly IAuthorizationService _authService;
     private readonly IThumbnailService _thumbnailService;
@@ -125,30 +135,17 @@ public class TelegramBotService
 
         if (data == "random_photo")
         {
-            var randomItem = await db.MediaItems
-                .Include(m => m.StorageSource)
-                .Where(m => !m.IsDeleted && m.StorageSource.IsEnabled)
-                .OrderBy(r => EF.Functions.Random())
-                .FirstOrDefaultAsync(ct);
-
-            if (randomItem != null && _authService.CanAccessPath(user, randomItem.StorageSourceId, randomItem.RelativePath))
+            await SendRandomPhotoAsync(bot, query.Message!.Chat.Id, user, db, sourceId: null, folder: null, ct);
+        }
+        else if (data.StartsWith("randfolder_"))
+        {
+            // Формат: randfolder_{sourceId}_{folder}
+            var parts = data.Substring("randfolder_".Length).Split(new[] { '_' }, 2);
+            if (parts.Length == 2 && int.TryParse(parts[0], out int sourceId))
             {
-                var fullPath = Path.Combine(randomItem.StorageSource.RootPath, randomItem.RelativePath.Replace('/', '\\'));
-                if (System.IO.File.Exists(fullPath))
-                {
-                    _logger.Log("Info", "Telegram", $"Отправка случайного фото пользователю @{user.Username}: {randomItem.FileName}", user.DisplayName);
-                    await using var stream = System.IO.File.OpenRead(fullPath);
-                    await bot.SendPhotoAsync(
-                        query.Message!.Chat.Id,
-                        InputFile.FromStream(stream, randomItem.FileName),
-                        caption: $"🎲 {randomItem.FileName}\n📁 {randomItem.RelativePath}",
-                        cancellationToken: ct
-                    );
-                    return;
-                }
+                string folder = parts[1];
+                await SendRandomPhotoAsync(bot, query.Message!.Chat.Id, user, db, sourceId, folder, ct);
             }
-
-            await bot.SendTextMessageAsync(query.Message!.Chat.Id, "Доступных фотографий не найдено.", cancellationToken: ct);
         }
         else if (data == "nav_sources")
         {
@@ -165,7 +162,7 @@ public class TelegramBotService
                 }
             }
 
-            buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") });
+            buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото (все источники)", "random_photo") });
 
             await bot.EditMessageTextAsync(
                 query.Message!.Chat.Id,
@@ -175,8 +172,60 @@ public class TelegramBotService
                 cancellationToken: ct
             );
         }
+        else if (data.StartsWith("sendfile_"))
+        {
+            // Формат: sendfile_{mediaItemId}
+            if (long.TryParse(data.Substring("sendfile_".Length), out long mediaId))
+            {
+                var item = await db.MediaItems.Include(m => m.StorageSource).FirstOrDefaultAsync(m => m.Id == mediaId, ct);
+                if (item != null && !item.IsDeleted && _authService.CanAccessPath(user, item.StorageSourceId, item.RelativePath))
+                {
+                    var fullPath = Path.Combine(item.StorageSource.RootPath, item.RelativePath.Replace('/', '\\'));
+                    if (System.IO.File.Exists(fullPath))
+                    {
+                        var ext = item.FileExtension.ToLowerInvariant();
+                        await using var stream = System.IO.File.OpenRead(fullPath);
+
+                        if (ImageExtensions.Contains(ext))
+                        {
+                            _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
+                            await bot.SendPhotoAsync(
+                                query.Message!.Chat.Id,
+                                InputFile.FromStream(stream, item.FileName),
+                                caption: $"🖼 {item.FileName}\n📁 {item.RelativePath}",
+                                cancellationToken: ct
+                            );
+                        }
+                        else if (VideoExtensions.Contains(ext))
+                        {
+                            _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
+                            // Лимит Telegram Bot API 50 МБ для прямой отправки
+                            if (item.FileSize < 50 * 1024 * 1024)
+                            {
+                                await bot.SendVideoAsync(
+                                    query.Message!.Chat.Id,
+                                    InputFile.FromStream(stream, item.FileName),
+                                    caption: $"🎬 {item.FileName}\n📁 {item.RelativePath}",
+                                    cancellationToken: ct
+                                );
+                            }
+                            else
+                            {
+                                await bot.SendDocumentAsync(
+                                    query.Message!.Chat.Id,
+                                    InputFile.FromStream(stream, item.FileName),
+                                    caption: $"🎬 {item.FileName} (размер: {item.FileSize / (1024 * 1024)} МБ)",
+                                    cancellationToken: ct
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         else if (data.StartsWith("browse_"))
         {
+            // Формат: browse_{sourceId}_{folder}_{page}
             var parts = data.Substring("browse_".Length).Split('_');
             if (parts.Length >= 3 && int.TryParse(parts[0], out int sourceId) && int.TryParse(parts[^1], out int page))
             {
@@ -184,8 +233,8 @@ public class TelegramBotService
                 var source = await db.StorageSources.FindAsync(new object[] { sourceId }, ct);
                 if (source != null && Directory.Exists(source.RootPath))
                 {
-                    var fullTargetDir = string.IsNullOrEmpty(folder) 
-                        ? source.RootPath 
+                    var fullTargetDir = string.IsNullOrEmpty(folder)
+                        ? source.RootPath
                         : Path.Combine(source.RootPath, folder.Replace('/', '\\'));
 
                     if (Directory.Exists(fullTargetDir))
@@ -193,21 +242,78 @@ public class TelegramBotService
                         var subDirs = Directory.GetDirectories(fullTargetDir)
                             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
                             .Where(rel => _authService.CanAccessPath(user, sourceId, rel))
+                            .OrderBy(d => d)
                             .ToList();
 
-                        var files = await db.MediaItems
-                            .Where(m => m.StorageSourceId == sourceId && !m.IsDeleted && m.RelativePath.StartsWith(folder))
-                            .Take(50)
+                        // Ищем файлы именно в текущей папке
+                        var normalizedFolder = folder.Trim('/');
+                        var allFolderFiles = await db.MediaItems
+                            .Where(m => m.StorageSourceId == sourceId && !m.IsDeleted)
                             .ToListAsync(ct);
+
+                        var currentFolderFiles = allFolderFiles
+                            .Where(m =>
+                            {
+                                var fileDir = Path.GetDirectoryName(m.RelativePath)?.Replace('\\', '/').Trim('/') ?? "";
+                                return string.Equals(fileDir, normalizedFolder, StringComparison.OrdinalIgnoreCase)
+                                       && _authService.CanAccessPath(user, sourceId, m.RelativePath);
+                            })
+                            .OrderBy(m => m.FileName)
+                            .ToList();
 
                         var keyboardRows = new List<InlineKeyboardButton[]>();
 
-                        foreach (var dir in subDirs.Take(10))
+                        // 1. Кнопка "Случайное фото из этой папки" (если есть фото)
+                        bool hasImagesInFolder = currentFolderFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
+                        if (hasImagesInFolder)
+                        {
+                            keyboardRows.Add(new[]
+                            {
+                                InlineKeyboardButton.WithCallbackData("🎲 Случайное фото из этой папки", $"randfolder_{sourceId}_{folder}")
+                            });
+                        }
+
+                        // 2. Список подпапок
+                        foreach (var dir in subDirs.Take(12))
                         {
                             var dirName = Path.GetFileName(dir);
                             keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"📁 {dirName}", $"browse_{sourceId}_{dir}_0") });
                         }
 
+                        // 3. Список файлов с пагинацией (по 6 файлов на страницу)
+                        const int pageSize = 6;
+                        int totalFiles = currentFolderFiles.Count;
+                        int totalPages = (int)Math.Ceiling(totalFiles / (double)pageSize);
+                        if (page >= totalPages && totalPages > 0) page = totalPages - 1;
+                        if (page < 0) page = 0;
+
+                        var pageFiles = currentFolderFiles.Skip(page * pageSize).Take(pageSize).ToList();
+                        foreach (var file in pageFiles)
+                        {
+                            var icon = ImageExtensions.Contains(file.FileExtension) ? "🖼" : (VideoExtensions.Contains(file.FileExtension) ? "🎬" : "📄");
+                            keyboardRows.Add(new[]
+                            {
+                                InlineKeyboardButton.WithCallbackData($"{icon} {file.FileName}", $"sendfile_{file.Id}")
+                            });
+                        }
+
+                        // Пагинация для файлов
+                        if (totalPages > 1)
+                        {
+                            var navButtons = new List<InlineKeyboardButton>();
+                            if (page > 0)
+                            {
+                                navButtons.Add(InlineKeyboardButton.WithCallbackData("⬅️ Назад", $"browse_{sourceId}_{folder}_{page - 1}"));
+                            }
+                            navButtons.Add(InlineKeyboardButton.WithCallbackData($"Стр. {page + 1}/{totalPages}", $"browse_{sourceId}_{folder}_{page}"));
+                            if (page < totalPages - 1)
+                            {
+                                navButtons.Add(InlineKeyboardButton.WithCallbackData("Вперед ➡️", $"browse_{sourceId}_{folder}_{page + 1}"));
+                            }
+                            keyboardRows.Add(navButtons.ToArray());
+                        }
+
+                        // 4. Кнопка возврата на уровень выше
                         if (!string.IsNullOrEmpty(folder))
                         {
                             var parentFolder = Path.GetDirectoryName(folder)?.Replace('\\', '/') ?? "";
@@ -218,10 +324,11 @@ public class TelegramBotService
                             keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData("⬅️ К источникам", "nav_sources") });
                         }
 
+                        var folderTitle = string.IsNullOrEmpty(folder) ? source.Name : Path.GetFileName(folder);
                         await bot.EditMessageTextAsync(
                             query.Message!.Chat.Id,
                             query.Message.MessageId,
-                            $"📁 Папка: {(string.IsNullOrEmpty(folder) ? source.Name : folder)}\nПодпапок: {subDirs.Count}, Файлов: {files.Count}",
+                            $"📁 Папка: {folderTitle}\nПодпапок: {subDirs.Count} | Файлов: {currentFolderFiles.Count}",
                             replyMarkup: new InlineKeyboardMarkup(keyboardRows),
                             cancellationToken: ct
                         );
@@ -229,6 +336,48 @@ public class TelegramBotService
                 }
             }
         }
+    }
+
+    private async Task SendRandomPhotoAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, AppDbContext db, int? sourceId, string? folder, CancellationToken ct)
+    {
+        var query = db.MediaItems
+            .Include(m => m.StorageSource)
+            .Where(m => !m.IsDeleted && m.StorageSource.IsEnabled);
+
+        if (sourceId.HasValue)
+        {
+            query = query.Where(m => m.StorageSourceId == sourceId.Value);
+        }
+
+        var allItems = await query.ToListAsync(ct);
+
+        // Фильтруем строго только фотографии (исключаем видео) и проверяем права
+        var candidatePhotos = allItems
+            .Where(m => ImageExtensions.Contains(m.FileExtension.ToLowerInvariant()))
+            .Where(m => string.IsNullOrEmpty(folder) || m.RelativePath.StartsWith(folder, StringComparison.OrdinalIgnoreCase))
+            .Where(m => _authService.CanAccessPath(user, m.StorageSourceId, m.RelativePath))
+            .ToList();
+
+        if (candidatePhotos.Any())
+        {
+            var randomItem = candidatePhotos[Random.Shared.Next(candidatePhotos.Count)];
+            var fullPath = Path.Combine(randomItem.StorageSource.RootPath, randomItem.RelativePath.Replace('/', '\\'));
+
+            if (System.IO.File.Exists(fullPath))
+            {
+                _logger.Log("Info", "Telegram", $"Отправка случайного фото: {randomItem.FileName} для @{user.DisplayName}", user.DisplayName);
+                await using var stream = System.IO.File.OpenRead(fullPath);
+                await bot.SendPhotoAsync(
+                    chatId,
+                    InputFile.FromStream(stream, randomItem.FileName),
+                    caption: $"🎲 {randomItem.FileName}\n📁 {randomItem.RelativePath}",
+                    cancellationToken: ct
+                );
+                return;
+            }
+        }
+
+        await bot.SendTextMessageAsync(chatId, "В этой папке/источнике не найдено доступных фотографий.", cancellationToken: ct);
     }
 
     private Task HandleErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken ct)

@@ -1,4 +1,6 @@
 ﻿using System.Collections.ObjectModel;
+using System.IO;
+using System.Text.Json;
 using System.Windows;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -11,6 +13,11 @@ using TrufaBot.Infrastructure.Logging;
 using TrufaBot.Infrastructure.Telegram;
 
 namespace TrufaBot.Presentation.ViewModels;
+
+public class AppConfigModel
+{
+    public string BotToken { get; set; } = "";
+}
 
 public partial class MainViewModel : ObservableObject
 {
@@ -59,7 +66,34 @@ public partial class MainViewModel : ObservableObject
             loggerImpl.LogAdded += OnLogAdded;
         }
 
+        LoadConfig();
         LoadData();
+    }
+
+    private void LoadConfig()
+    {
+        AppPaths.EnsureDirectoriesCreated();
+        if (File.Exists(AppPaths.ConfigFilePath))
+        {
+            try
+            {
+                var json = File.ReadAllText(AppPaths.ConfigFilePath);
+                var config = JsonSerializer.Deserialize<AppConfigModel>(json);
+                if (config != null && !string.IsNullOrWhiteSpace(config.BotToken))
+                {
+                    BotToken = config.BotToken;
+                }
+            }
+            catch { }
+        }
+    }
+
+    private void SaveConfig()
+    {
+        AppPaths.EnsureDirectoriesCreated();
+        var config = new AppConfigModel { BotToken = BotToken };
+        var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(AppPaths.ConfigFilePath, json);
     }
 
     private void OnLogAdded(AuditLogEntry entry)
@@ -79,7 +113,7 @@ public partial class MainViewModel : ObservableObject
 
         Sources = new ObservableCollection<StorageSource>(db.StorageSources.ToList());
         Users = new ObservableCollection<User>(db.Users.Include(u => u.Permissions).ToList());
-        
+
         var historyLogs = db.AuditLogs.OrderByDescending(l => l.Timestamp).Take(100).ToList();
         Logs = new ObservableCollection<AuditLogEntry>(historyLogs);
     }
@@ -101,9 +135,10 @@ public partial class MainViewModel : ObservableObject
                 return;
             }
 
+            SaveConfig();
             _botService.Start(BotToken);
             IsBotRunning = true;
-            StatusText = "🟢 Сервер активен (работает Telegram-бот)";
+            StatusText = "🟢 Сервер активен (Telegram-бот слушает)";
         }
     }
 
@@ -128,7 +163,50 @@ public partial class MainViewModel : ObservableObject
         NewSourceName = "";
         NewSourcePath = "";
         LoadData();
-        _auditLogger.Log("Info", "Storage", $"Добавлен новый источник: {source.Name} ({source.RootPath})");
+        _auditLogger.Log("Info", "Storage", $"Добавлен источник: {source.Name} ({source.RootPath})");
+
+        await _syncService.SynchronizeSourceAsync(source.Id);
+        LoadData();
+    }
+
+    [RelayCommand]
+    private async Task DeleteSourceAsync(StorageSource? source)
+    {
+        if (source == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.StorageSources
+            .Include(s => s.MediaItems)
+            .Include(s => s.Permissions)
+            .FirstOrDefaultAsync(s => s.Id == source.Id);
+
+        if (existing != null)
+        {
+            db.MediaItems.RemoveRange(existing.MediaItems);
+            db.UserFolderPermissions.RemoveRange(existing.Permissions);
+            db.StorageSources.Remove(existing);
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Storage", $"Удален источник: {source.Name}");
+            LoadData();
+        }
+    }
+
+    [RelayCommand]
+    private async Task ToggleSourceEnabledAsync(StorageSource? source)
+    {
+        if (source == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.StorageSources.FindAsync(source.Id);
+        if (existing != null)
+        {
+            existing.IsEnabled = !existing.IsEnabled;
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Storage", $"Источник '{existing.Name}' {(existing.IsEnabled ? "включен" : "отключен")}");
+            LoadData();
+        }
     }
 
     [RelayCommand]
@@ -156,11 +234,52 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private async Task DeleteUserAsync(User? user)
+    {
+        if (user == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.Users
+            .Include(u => u.Permissions)
+            .FirstOrDefaultAsync(u => u.Id == user.Id);
+
+        if (existing != null)
+        {
+            db.UserFolderPermissions.RemoveRange(existing.Permissions);
+            db.Users.Remove(existing);
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Security", $"Удален пользователь: {user.DisplayName} (ID: {user.TelegramUserId})");
+            LoadData();
+        }
+    }
+
+    [RelayCommand]
+    private async Task ToggleUserActiveAsync(User? user)
+    {
+        if (user == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.Users.FindAsync(user.Id);
+        if (existing != null)
+        {
+            existing.IsActive = !existing.IsActive;
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Security", $"Пользователь '{existing.DisplayName}' {(existing.IsActive ? "активирован" : "деактивирован")}");
+            LoadData();
+        }
+    }
+
+    [RelayCommand]
     private async Task SyncAllSourcesAsync()
     {
         foreach (var source in Sources)
         {
-            await _syncService.SynchronizeSourceAsync(source.Id);
+            if (source.IsEnabled)
+            {
+                await _syncService.SynchronizeSourceAsync(source.Id);
+            }
         }
         LoadData();
     }
