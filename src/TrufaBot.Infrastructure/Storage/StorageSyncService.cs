@@ -10,12 +10,12 @@ public class StorageSyncService : IStorageSyncService
     private readonly IAuditLogger _logger;
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".jpg", ".jpeg", ".png", ".webp", ".heic", ".mp4", ".mov", ".avi", ".mkv"
+        ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".mp4", ".mov", ".avi", ".mkv", ".webm"
     };
 
     private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
     {
-        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp"
+        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp", "thumbnails"
     };
 
     public StorageSyncService(IAuditLogger logger)
@@ -23,90 +23,135 @@ public class StorageSyncService : IStorageSyncService
         _logger = logger;
     }
 
-    public static bool IsIgnoredPath(string path)
+    public static bool IsIgnoredDirectory(string dirName)
     {
-        var parts = path.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-        return parts.Any(p => IgnoredDirectories.Contains(p) || p.StartsWith("@") || p.StartsWith("$") || (p.StartsWith(".") && p.Length > 1));
+        var name = dirName.Trim().ToLowerInvariant();
+        return IgnoredDirectories.Contains(name) || name.StartsWith("@") || name.StartsWith("$") || (name.StartsWith(".") && name.Length > 1);
     }
 
     public async Task SynchronizeSourceAsync(int sourceId, CancellationToken ct = default)
     {
-        using var db = new AppDbContext();
-        var source = await db.StorageSources.FindAsync(new object[] { sourceId }, ct);
-        if (source == null || !source.IsEnabled) return;
-
-        if (!Directory.Exists(source.RootPath))
+        await Task.Run(async () =>
         {
-            _logger.Log("Warning", "Storage", $"Хранилище '{source.Name}' недоступно по пути: {source.RootPath}");
-            return;
-        }
+            using var db = new AppDbContext();
+            db.ChangeTracker.AutoDetectChangesEnabled = false;
 
-        _logger.Log("Info", "Storage", $"Начато сканирование источника: {source.Name} ({source.RootPath})");
+            var source = await db.StorageSources.FindAsync(new object[] { sourceId }, ct);
+            if (source == null || !source.IsEnabled) return;
 
-        var existingItems = await db.MediaItems
-            .Where(m => m.StorageSourceId == sourceId)
-            .ToDictionaryAsync(m => m.RelativePath, ct);
-
-        var diskFiles = Directory.EnumerateFiles(source.RootPath, "*.*", SearchOption.AllDirectories)
-            .Where(f => SupportedExtensions.Contains(Path.GetExtension(f)) && !IsIgnoredPath(f))
-            .ToList();
-
-        var diskRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        int addedCount = 0;
-        int modifiedCount = 0;
-
-        foreach (var filePath in diskFiles)
-        {
-            var relativePath = Path.GetRelativePath(source.RootPath, filePath).Replace('\\', '/');
-            if (IsIgnoredPath(relativePath)) continue;
-
-            diskRelativePaths.Add(relativePath);
-            var fileInfo = new FileInfo(filePath);
-
-            if (!existingItems.TryGetValue(relativePath, out var mediaItem))
+            if (!Directory.Exists(source.RootPath))
             {
-                mediaItem = new MediaItem
-                {
-                    StorageSourceId = sourceId,
-                    RelativePath = relativePath,
-                    FileName = fileInfo.Name,
-                    FileExtension = fileInfo.Extension.ToLowerInvariant(),
-                    FileSize = fileInfo.Length,
-                    FileCreatedAt = fileInfo.CreationTimeUtc,
-                    FileModifiedAt = fileInfo.LastWriteTimeUtc,
-                    IsDeleted = false,
-                    ClassificationStatus = ClassificationStatus.Pending,
-                    LastIndexedAt = DateTime.UtcNow
-                };
-                db.MediaItems.Add(mediaItem);
-                addedCount++;
+                _logger.Log("Warning", "Storage", $"Хранилище '{source.Name}' недоступно по пути: {source.RootPath}");
+                return;
             }
-            else
+
+            _logger.Log("Info", "Storage", $"Начато быстрое сканирование: {source.Name} ({source.RootPath})");
+
+            var existingItems = await db.MediaItems
+                .Where(m => m.StorageSourceId == sourceId)
+                .ToDictionaryAsync(m => m.RelativePath, StringComparer.OrdinalIgnoreCase, ct);
+
+            var diskRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var itemsToAdd = new List<MediaItem>();
+            int modifiedCount = 0;
+
+            // Быстрый рекурсивный обход с мгновенным пропуском мусорных/системных папок (@Recycle и т.д.)
+            var dirsToScan = new Stack<string>();
+            dirsToScan.Push(source.RootPath);
+
+            int scannedFilesTotal = 0;
+
+            while (dirsToScan.Count > 0)
             {
-                if (mediaItem.IsDeleted || mediaItem.FileSize != fileInfo.Length || mediaItem.FileModifiedAt != fileInfo.LastWriteTimeUtc)
+                ct.ThrowIfCancellationRequested();
+                var currentDir = dirsToScan.Pop();
+
+                try
                 {
-                    mediaItem.IsDeleted = false;
-                    mediaItem.FileSize = fileInfo.Length;
-                    mediaItem.FileModifiedAt = fileInfo.LastWriteTimeUtc;
-                    mediaItem.ClassificationStatus = ClassificationStatus.Pending;
-                    modifiedCount++;
+                    var dirInfo = new DirectoryInfo(currentDir);
+
+                    // 1. Добавляем подпапки, исключая мусорные и скрытые
+                    foreach (var subDir in dirInfo.EnumerateDirectories())
+                    {
+                        if (!IsIgnoredDirectory(subDir.Name) && (subDir.Attributes & FileAttributes.Hidden) == 0)
+                        {
+                            dirsToScan.Push(subDir.FullName);
+                        }
+                    }
+
+                    // 2. Сканируем медиафайлы в текущей папке
+                    foreach (var file in dirInfo.EnumerateFiles())
+                    {
+                        if (!SupportedExtensions.Contains(file.Extension)) continue;
+                        if ((file.Attributes & FileAttributes.Hidden) != 0) continue;
+
+                        scannedFilesTotal++;
+                        var relativePath = Path.GetRelativePath(source.RootPath, file.FullName).Replace('\\', '/');
+                        diskRelativePaths.Add(relativePath);
+
+                        if (!existingItems.TryGetValue(relativePath, out var mediaItem))
+                        {
+                            itemsToAdd.Add(new MediaItem
+                            {
+                                StorageSourceId = sourceId,
+                                RelativePath = relativePath,
+                                FileName = file.Name,
+                                FileExtension = file.Extension.ToLowerInvariant(),
+                                FileSize = file.Length,
+                                FileCreatedAt = file.CreationTimeUtc,
+                                FileModifiedAt = file.LastWriteTimeUtc,
+                                IsDeleted = false,
+                                ClassificationStatus = ClassificationStatus.Pending,
+                                LastIndexedAt = DateTime.UtcNow
+                            });
+                        }
+                        else
+                        {
+                            if (mediaItem.IsDeleted || mediaItem.FileSize != file.Length || mediaItem.FileModifiedAt != file.LastWriteTimeUtc)
+                            {
+                                mediaItem.IsDeleted = false;
+                                mediaItem.FileSize = file.Length;
+                                mediaItem.FileModifiedAt = file.LastWriteTimeUtc;
+                                mediaItem.ClassificationStatus = ClassificationStatus.Pending;
+                                db.Entry(mediaItem).State = EntityState.Modified;
+                                modifiedCount++;
+                            }
+                        }
+                    }
+                }
+                catch (UnauthorizedAccessException) { }
+                catch (DirectoryNotFoundException) { }
+                catch (Exception ex)
+                {
+                    _logger.Log("Warning", "Storage", $"Ошибка доступа к папке '{currentDir}': {ex.Message}");
                 }
             }
-        }
 
-        int deletedCount = 0;
-        foreach (var (relPath, item) in existingItems)
-        {
-            if (!diskRelativePaths.Contains(relPath) && !item.IsDeleted)
+            // Пакетная вставка новых файлов
+            if (itemsToAdd.Count > 0)
             {
-                item.IsDeleted = true;
-                deletedCount++;
+                await db.MediaItems.AddRangeAsync(itemsToAdd, ct);
             }
-        }
 
-        source.LastScannedAt = DateTime.UtcNow;
-        await db.SaveChangesAsync(ct);
+            // Помечаем удаленные файлы
+            int deletedCount = 0;
+            foreach (var (relPath, item) in existingItems)
+            {
+                if (!diskRelativePaths.Contains(relPath) && !item.IsDeleted)
+                {
+                    item.IsDeleted = true;
+                    db.Entry(item).State = EntityState.Modified;
+                    deletedCount++;
+                }
+            }
 
-        _logger.Log("Info", "Storage", $"Синхронизация '{source.Name}' завершена. Добавлено: {addedCount}, Обновлено: {modifiedCount}, Удалено: {deletedCount}");
+            source.LastScannedAt = DateTime.UtcNow;
+            db.Entry(source).State = EntityState.Modified;
+
+            db.ChangeTracker.AutoDetectChangesEnabled = true;
+            await db.SaveChangesAsync(ct);
+
+            _logger.Log("Info", "Storage", $"Синхронизация '{source.Name}' завершена. Сканировано: {scannedFilesTotal}, Новых: {itemsToAdd.Count}, Обновлено: {modifiedCount}, Удалено: {deletedCount}");
+        }, ct);
     }
 }

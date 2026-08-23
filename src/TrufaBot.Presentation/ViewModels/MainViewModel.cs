@@ -32,6 +32,9 @@ public partial class MainViewModel : ObservableObject
     private bool _isBotRunning;
 
     [ObservableProperty]
+    private bool _isSyncing;
+
+    [ObservableProperty]
     private string _statusText = "Сервер остановлен";
 
     [ObservableProperty]
@@ -232,7 +235,6 @@ public partial class MainViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(NewSourceName) || string.IsNullOrWhiteSpace(NewSourcePath))
             return;
 
-        using var db = new AppDbContext();
         var source = new StorageSource
         {
             Name = NewSourceName.Trim(),
@@ -241,16 +243,26 @@ public partial class MainViewModel : ObservableObject
             IsEnabled = true
         };
 
-        db.StorageSources.Add(source);
-        await db.SaveChangesAsync();
+        using (var db = new AppDbContext())
+        {
+            db.StorageSources.Add(source);
+            await db.SaveChangesAsync();
+        }
 
         NewSourceName = "";
         NewSourcePath = "";
         LoadData();
         _auditLogger.Log("Info", "Storage", $"Добавлен источник: {source.Name} ({source.RootPath})");
 
-        await _syncService.SynchronizeSourceAsync(source.Id);
-        LoadData();
+        _ = Task.Run(async () =>
+        {
+            await _syncService.SynchronizeSourceAsync(source.Id);
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            {
+                LoadData();
+                UpdateAvailableFoldersForSelectedSource();
+            });
+        });
     }
 
     [RelayCommand]
@@ -423,14 +435,27 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task SyncAllSourcesAsync()
     {
-        foreach (var source in Sources)
+        if (IsSyncing) return;
+
+        IsSyncing = true;
+        var prevStatus = StatusText;
+        StatusText = "⏳ Идет быстрое фоновое сканирование NAS...";
+
+        try
         {
-            if (source.IsEnabled)
+            var enabledSources = Sources.Where(s => s.IsEnabled).ToList();
+            foreach (var source in enabledSources)
             {
                 await _syncService.SynchronizeSourceAsync(source.Id);
             }
+
+            LoadData();
+            UpdateAvailableFoldersForSelectedSource();
         }
-        LoadData();
-        UpdateAvailableFoldersForSelectedSource();
+        finally
+        {
+            IsSyncing = false;
+            StatusText = IsBotRunning ? "🟢 Сервер активен (Telegram-бот слушает)" : "Сервер остановлен";
+        }
     }
 }
