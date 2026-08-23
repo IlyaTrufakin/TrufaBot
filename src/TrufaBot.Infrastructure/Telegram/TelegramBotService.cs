@@ -1,4 +1,5 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Collections.Concurrent;
+using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
@@ -13,6 +14,16 @@ using TrufaBot.Infrastructure.Storage;
 
 namespace TrufaBot.Infrastructure.Telegram;
 
+public class UserBrowseState
+{
+    public int SourceId { get; set; }
+    public string FolderPath { get; set; } = "";
+    public int DirPage { get; set; } = 0;
+    public int FilePage { get; set; } = 0;
+    public List<string> CachedSubDirs { get; set; } = new();
+    public List<MediaItem> CachedFiles { get; set; } = new();
+}
+
 public class TelegramBotService
 {
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -25,9 +36,15 @@ public class TelegramBotService
         ".mp4", ".mov", ".avi", ".mkv", ".webm"
     };
 
+    private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp"
+    };
+
     private readonly IAuditLogger _logger;
     private readonly IAuthorizationService _authService;
     private readonly IThumbnailService _thumbnailService;
+    private readonly ConcurrentDictionary<long, UserBrowseState> _userSessions = new();
     private ITelegramBotClient? _botClient;
     private CancellationTokenSource? _cts;
 
@@ -67,6 +84,12 @@ public class TelegramBotService
         _cts?.Cancel();
         _botClient = null;
         _logger.Log("Info", "Telegram", "Telegram бот остановлен.");
+    }
+
+    private static bool IsIgnoredPath(string path)
+    {
+        var parts = path.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        return parts.Any(p => IgnoredDirectories.Contains(p) || p.StartsWith("@") || p.StartsWith("$") || (p.StartsWith(".") && p.Length > 1));
     }
 
     private async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
@@ -132,20 +155,13 @@ public class TelegramBotService
     {
         await bot.AnswerCallbackQueryAsync(query.Id, cancellationToken: ct);
         var data = query.Data ?? "";
+        long userId = query.From.Id;
+        long chatId = query.Message!.Chat.Id;
+        int messageId = query.Message.MessageId;
 
         if (data == "random_photo")
         {
-            await SendRandomPhotoAsync(bot, query.Message!.Chat.Id, user, db, sourceId: null, folder: null, ct);
-        }
-        else if (data.StartsWith("randfolder_"))
-        {
-            // Формат: randfolder_{sourceId}_{folder}
-            var parts = data.Substring("randfolder_".Length).Split(new[] { '_' }, 2);
-            if (parts.Length == 2 && int.TryParse(parts[0], out int sourceId))
-            {
-                string folder = parts[1];
-                await SendRandomPhotoAsync(bot, query.Message!.Chat.Id, user, db, sourceId, folder, ct);
-            }
+            await SendRandomPhotoAsync(bot, chatId, user, db, sourceId: null, folder: null, ct);
         }
         else if (data == "nav_sources")
         {
@@ -158,24 +174,121 @@ public class TelegramBotService
             {
                 if (_authService.CanAccessPath(user, src.Id, "*"))
                 {
-                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 {src.Name}", $"browse_{src.Id}__0") });
+                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 {src.Name}", $"select_src_{src.Id}") });
                 }
             }
 
             buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото (все источники)", "random_photo") });
 
             await bot.EditMessageTextAsync(
-                query.Message!.Chat.Id,
-                query.Message.MessageId,
+                chatId,
+                messageId,
                 "📂 Выберите источник медиафайлов:",
                 replyMarkup: new InlineKeyboardMarkup(buttons),
                 cancellationToken: ct
             );
         }
-        else if (data.StartsWith("sendfile_"))
+        else if (data.StartsWith("select_src_"))
         {
-            // Формат: sendfile_{mediaItemId}
-            if (long.TryParse(data.Substring("sendfile_".Length), out long mediaId))
+            if (int.TryParse(data.Substring("select_src_".Length), out int sourceId))
+            {
+                var state = new UserBrowseState
+                {
+                    SourceId = sourceId,
+                    FolderPath = "",
+                    DirPage = 0,
+                    FilePage = 0
+                };
+                _userSessions[userId] = state;
+                await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+            }
+        }
+        else if (data == "nav_root")
+        {
+            if (_userSessions.TryGetValue(userId, out var state))
+            {
+                state.FolderPath = "";
+                state.DirPage = 0;
+                state.FilePage = 0;
+                await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+            }
+        }
+        else if (data == "nav_up")
+        {
+            if (_userSessions.TryGetValue(userId, out var state))
+            {
+                if (!string.IsNullOrEmpty(state.FolderPath))
+                {
+                    var parent = Path.GetDirectoryName(state.FolderPath)?.Replace('\\', '/') ?? "";
+                    state.FolderPath = parent;
+                    state.DirPage = 0;
+                    state.FilePage = 0;
+                    await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+                }
+                else
+                {
+                    // Вернуться к списку источников
+                    await HandleCallbackQueryAsync(bot, new CallbackQuery { From = query.From, Data = "nav_sources", Message = query.Message }, user, db, ct);
+                }
+            }
+        }
+        else if (data.StartsWith("enter_dir_"))
+        {
+            if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("enter_dir_".Length), out int dirIndex))
+            {
+                if (dirIndex >= 0 && dirIndex < state.CachedSubDirs.Count)
+                {
+                    state.FolderPath = state.CachedSubDirs[dirIndex];
+                    state.DirPage = 0;
+                    state.FilePage = 0;
+                    await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+                }
+            }
+        }
+        else if (data.StartsWith("dir_page_"))
+        {
+            if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("dir_page_".Length), out int newDirPage))
+            {
+                state.DirPage = newDirPage;
+                await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+            }
+        }
+        else if (data.StartsWith("file_page_"))
+        {
+            if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("file_page_".Length), out int newFilePage))
+            {
+                state.FilePage = newFilePage;
+                await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+            }
+        }
+        else if (data == "rand_current_folder")
+        {
+            if (_userSessions.TryGetValue(userId, out var state))
+            {
+                await SendRandomPhotoAsync(bot, chatId, user, db, state.SourceId, state.FolderPath, ct);
+            }
+        }
+        else if (data == "preview_album")
+        {
+            if (_userSessions.TryGetValue(userId, out var state))
+            {
+                await SendPreviewAlbumAsync(bot, chatId, user, db, state, ct);
+            }
+        }
+        else if (data.StartsWith("view_file_"))
+        {
+            if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("view_file_".Length), out int fileIndex))
+            {
+                if (fileIndex >= 0 && fileIndex < state.CachedFiles.Count)
+                {
+                    var file = state.CachedFiles[fileIndex];
+                    await SendSingleMediaFileAsync(bot, chatId, user, file, ct);
+                }
+            }
+        }
+        else if (data.StartsWith("orig_file_"))
+        {
+            if (long.TryParse(data.Substring("orig_file_".Length), out long mediaId))
             {
                 var item = await db.MediaItems.Include(m => m.StorageSource).FirstOrDefaultAsync(m => m.Id == mediaId, ct);
                 if (item != null && !item.IsDeleted && _authService.CanAccessPath(user, item.StorageSourceId, item.RelativePath))
@@ -183,157 +296,272 @@ public class TelegramBotService
                     var fullPath = Path.Combine(item.StorageSource.RootPath, item.RelativePath.Replace('/', '\\'));
                     if (System.IO.File.Exists(fullPath))
                     {
-                        var ext = item.FileExtension.ToLowerInvariant();
+                        _logger.Log("Info", "Telegram", $"Отправка оригинала: {item.FileName} для @{user.DisplayName}", user.DisplayName);
                         await using var stream = System.IO.File.OpenRead(fullPath);
-
-                        if (ImageExtensions.Contains(ext))
-                        {
-                            _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
-                            await bot.SendPhotoAsync(
-                                query.Message!.Chat.Id,
-                                InputFile.FromStream(stream, item.FileName),
-                                caption: $"🖼 {item.FileName}\n📁 {item.RelativePath}",
-                                cancellationToken: ct
-                            );
-                        }
-                        else if (VideoExtensions.Contains(ext))
-                        {
-                            _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
-                            // Лимит Telegram Bot API 50 МБ для прямой отправки
-                            if (item.FileSize < 50 * 1024 * 1024)
-                            {
-                                await bot.SendVideoAsync(
-                                    query.Message!.Chat.Id,
-                                    InputFile.FromStream(stream, item.FileName),
-                                    caption: $"🎬 {item.FileName}\n📁 {item.RelativePath}",
-                                    cancellationToken: ct
-                                );
-                            }
-                            else
-                            {
-                                await bot.SendDocumentAsync(
-                                    query.Message!.Chat.Id,
-                                    InputFile.FromStream(stream, item.FileName),
-                                    caption: $"🎬 {item.FileName} (размер: {item.FileSize / (1024 * 1024)} МБ)",
-                                    cancellationToken: ct
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        else if (data.StartsWith("browse_"))
-        {
-            // Формат: browse_{sourceId}_{folder}_{page}
-            var parts = data.Substring("browse_".Length).Split('_');
-            if (parts.Length >= 3 && int.TryParse(parts[0], out int sourceId) && int.TryParse(parts[^1], out int page))
-            {
-                string folder = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
-                var source = await db.StorageSources.FindAsync(new object[] { sourceId }, ct);
-                if (source != null && Directory.Exists(source.RootPath))
-                {
-                    var fullTargetDir = string.IsNullOrEmpty(folder)
-                        ? source.RootPath
-                        : Path.Combine(source.RootPath, folder.Replace('/', '\\'));
-
-                    if (Directory.Exists(fullTargetDir))
-                    {
-                        var subDirs = Directory.GetDirectories(fullTargetDir)
-                            .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
-                            .Where(rel => _authService.CanAccessPath(user, sourceId, rel))
-                            .OrderBy(d => d)
-                            .ToList();
-
-                        // Ищем файлы именно в текущей папке
-                        var normalizedFolder = folder.Trim('/');
-                        var allFolderFiles = await db.MediaItems
-                            .Where(m => m.StorageSourceId == sourceId && !m.IsDeleted)
-                            .ToListAsync(ct);
-
-                        var currentFolderFiles = allFolderFiles
-                            .Where(m =>
-                            {
-                                var fileDir = Path.GetDirectoryName(m.RelativePath)?.Replace('\\', '/').Trim('/') ?? "";
-                                return string.Equals(fileDir, normalizedFolder, StringComparison.OrdinalIgnoreCase)
-                                       && _authService.CanAccessPath(user, sourceId, m.RelativePath);
-                            })
-                            .OrderBy(m => m.FileName)
-                            .ToList();
-
-                        var keyboardRows = new List<InlineKeyboardButton[]>();
-
-                        // 1. Кнопка "Случайное фото из этой папки" (если есть фото)
-                        bool hasImagesInFolder = currentFolderFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
-                        if (hasImagesInFolder)
-                        {
-                            keyboardRows.Add(new[]
-                            {
-                                InlineKeyboardButton.WithCallbackData("🎲 Случайное фото из этой папки", $"randfolder_{sourceId}_{folder}")
-                            });
-                        }
-
-                        // 2. Список подпапок
-                        foreach (var dir in subDirs.Take(12))
-                        {
-                            var dirName = Path.GetFileName(dir);
-                            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"📁 {dirName}", $"browse_{sourceId}_{dir}_0") });
-                        }
-
-                        // 3. Список файлов с пагинацией (по 6 файлов на страницу)
-                        const int pageSize = 6;
-                        int totalFiles = currentFolderFiles.Count;
-                        int totalPages = (int)Math.Ceiling(totalFiles / (double)pageSize);
-                        if (page >= totalPages && totalPages > 0) page = totalPages - 1;
-                        if (page < 0) page = 0;
-
-                        var pageFiles = currentFolderFiles.Skip(page * pageSize).Take(pageSize).ToList();
-                        foreach (var file in pageFiles)
-                        {
-                            var icon = ImageExtensions.Contains(file.FileExtension) ? "🖼" : (VideoExtensions.Contains(file.FileExtension) ? "🎬" : "📄");
-                            keyboardRows.Add(new[]
-                            {
-                                InlineKeyboardButton.WithCallbackData($"{icon} {file.FileName}", $"sendfile_{file.Id}")
-                            });
-                        }
-
-                        // Пагинация для файлов
-                        if (totalPages > 1)
-                        {
-                            var navButtons = new List<InlineKeyboardButton>();
-                            if (page > 0)
-                            {
-                                navButtons.Add(InlineKeyboardButton.WithCallbackData("⬅️ Назад", $"browse_{sourceId}_{folder}_{page - 1}"));
-                            }
-                            navButtons.Add(InlineKeyboardButton.WithCallbackData($"Стр. {page + 1}/{totalPages}", $"browse_{sourceId}_{folder}_{page}"));
-                            if (page < totalPages - 1)
-                            {
-                                navButtons.Add(InlineKeyboardButton.WithCallbackData("Вперед ➡️", $"browse_{sourceId}_{folder}_{page + 1}"));
-                            }
-                            keyboardRows.Add(navButtons.ToArray());
-                        }
-
-                        // 4. Кнопка возврата на уровень выше
-                        if (!string.IsNullOrEmpty(folder))
-                        {
-                            var parentFolder = Path.GetDirectoryName(folder)?.Replace('\\', '/') ?? "";
-                            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData("⬆️ На уровень вверх", $"browse_{sourceId}_{parentFolder}_0") });
-                        }
-                        else
-                        {
-                            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData("⬅️ К источникам", "nav_sources") });
-                        }
-
-                        var folderTitle = string.IsNullOrEmpty(folder) ? source.Name : Path.GetFileName(folder);
-                        await bot.EditMessageTextAsync(
-                            query.Message!.Chat.Id,
-                            query.Message.MessageId,
-                            $"📁 Папка: {folderTitle}\nПодпапок: {subDirs.Count} | Файлов: {currentFolderFiles.Count}",
-                            replyMarkup: new InlineKeyboardMarkup(keyboardRows),
+                        await bot.SendDocumentAsync(
+                            chatId,
+                            InputFile.FromStream(stream, item.FileName),
+                            caption: $"📥 Оригинал: {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
                             cancellationToken: ct
                         );
                     }
                 }
+            }
+        }
+    }
+
+    private async Task RenderBrowseViewAsync(ITelegramBotClient bot, long chatId, int messageId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
+    {
+        var source = await db.StorageSources.FindAsync(new object[] { state.SourceId }, ct);
+        if (source == null || !Directory.Exists(source.RootPath))
+        {
+            await bot.EditMessageTextAsync(chatId, messageId, "Хранилище временно недоступно.", cancellationToken: ct);
+            return;
+        }
+
+        var fullTargetDir = string.IsNullOrEmpty(state.FolderPath)
+            ? source.RootPath
+            : Path.Combine(source.RootPath, state.FolderPath.Replace('/', '\\'));
+
+        if (!Directory.Exists(fullTargetDir))
+        {
+            state.FolderPath = "";
+            fullTargetDir = source.RootPath;
+        }
+
+        // 1. Считываем подпапки (исключая @Recycle и скрытые/системные папки)
+        state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
+            .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
+            .Where(rel => !IsIgnoredPath(rel) && _authService.CanAccessPath(user, state.SourceId, rel))
+            .OrderBy(d => d)
+            .ToList();
+
+        // 2. Считываем файлы в текущей папке
+        var normalizedFolder = state.FolderPath.Trim('/');
+        var allFolderFiles = await db.MediaItems
+            .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
+            .ToListAsync(ct);
+
+        state.CachedFiles = allFolderFiles
+            .Where(m =>
+            {
+                if (IsIgnoredPath(m.RelativePath)) return false;
+                var fileDir = Path.GetDirectoryName(m.RelativePath)?.Replace('\\', '/').Trim('/') ?? "";
+                return string.Equals(fileDir, normalizedFolder, StringComparison.OrdinalIgnoreCase)
+                       && _authService.CanAccessPath(user, state.SourceId, m.RelativePath);
+            })
+            .OrderBy(m => m.FileName)
+            .ToList();
+
+        var keyboardRows = new List<InlineKeyboardButton[]>();
+
+        // Быстрые действия вверху
+        var quickActions = new List<InlineKeyboardButton>();
+        bool hasImages = state.CachedFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
+        if (hasImages)
+        {
+            quickActions.Add(InlineKeyboardButton.WithCallbackData("📸 Предпросмотр (альбом)", "preview_album"));
+            quickActions.Add(InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "rand_current_folder"));
+        }
+        if (quickActions.Count > 0)
+        {
+            keyboardRows.Add(quickActions.ToArray());
+        }
+
+        // --- СПИСОК ПОДПАПОК (По 6 папок на страницу) ---
+        const int dirPageSize = 6;
+        int totalDirs = state.CachedSubDirs.Count;
+        int totalDirPages = (int)Math.Ceiling(totalDirs / (double)dirPageSize);
+        if (state.DirPage >= totalDirPages && totalDirPages > 0) state.DirPage = totalDirPages - 1;
+        if (state.DirPage < 0) state.DirPage = 0;
+
+        var currentDirSlice = state.CachedSubDirs.Skip(state.DirPage * dirPageSize).Take(dirPageSize).ToList();
+        for (int i = 0; i < currentDirSlice.Count; i++)
+        {
+            int globalIndex = state.DirPage * dirPageSize + i;
+            var dirName = Path.GetFileName(currentDirSlice[i]);
+            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"📁 {dirName}", $"enter_dir_{globalIndex}") });
+        }
+
+        if (totalDirPages > 1)
+        {
+            var dirNav = new List<InlineKeyboardButton>();
+            if (state.DirPage > 0)
+                dirNav.Add(InlineKeyboardButton.WithCallbackData("⬅️ Папки", $"dir_page_{state.DirPage - 1}"));
+            dirNav.Add(InlineKeyboardButton.WithCallbackData($"Папки {state.DirPage + 1}/{totalDirPages}", $"dir_page_{state.DirPage}"));
+            if (state.DirPage < totalDirPages - 1)
+                dirNav.Add(InlineKeyboardButton.WithCallbackData("Папки ➡️", $"dir_page_{state.DirPage + 1}"));
+            keyboardRows.Add(dirNav.ToArray());
+        }
+
+        // --- СПИСОК ФАЙЛОВ (По 5 файлов на страницу) ---
+        const int filePageSize = 5;
+        int totalFiles = state.CachedFiles.Count;
+        int totalFilePages = (int)Math.Ceiling(totalFiles / (double)filePageSize);
+        if (state.FilePage >= totalFilePages && totalFilePages > 0) state.FilePage = totalFilePages - 1;
+        if (state.FilePage < 0) state.FilePage = 0;
+
+        var currentFileSlice = state.CachedFiles.Skip(state.FilePage * filePageSize).Take(filePageSize).ToList();
+        for (int i = 0; i < currentFileSlice.Count; i++)
+        {
+            int globalFileIndex = state.FilePage * filePageSize + i;
+            var file = currentFileSlice[i];
+            var icon = ImageExtensions.Contains(file.FileExtension) ? "🖼" : (VideoExtensions.Contains(file.FileExtension) ? "🎬" : "📄");
+            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"{icon} {file.FileName}", $"view_file_{globalFileIndex}") });
+        }
+
+        if (totalFilePages > 1)
+        {
+            var fileNav = new List<InlineKeyboardButton>();
+            if (state.FilePage > 0)
+                fileNav.Add(InlineKeyboardButton.WithCallbackData("⬅️ Фото", $"file_page_{state.FilePage - 1}"));
+            fileNav.Add(InlineKeyboardButton.WithCallbackData($"Файлы {state.FilePage + 1}/{totalFilePages}", $"file_page_{state.FilePage}"));
+            if (state.FilePage < totalFilePages - 1)
+                fileNav.Add(InlineKeyboardButton.WithCallbackData("Фото ➡️", $"file_page_{state.FilePage + 1}"));
+            keyboardRows.Add(fileNav.ToArray());
+        }
+
+        // Навигация вверх / к источникам
+        if (!string.IsNullOrEmpty(state.FolderPath))
+        {
+            keyboardRows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("⬆️ Вверх", "nav_up"),
+                InlineKeyboardButton.WithCallbackData("🏠 В корень источника", "nav_root")
+            });
+        }
+        else
+        {
+            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData("⬅️ К источникам", "nav_sources") });
+        }
+
+        var folderTitle = string.IsNullOrEmpty(state.FolderPath) ? source.Name : Path.GetFileName(state.FolderPath);
+        var messageText = $"📁 <b>Папка:</b> {folderTitle}\n" +
+                          $"📂 <b>Подпапок:</b> {totalDirs} | 🖼 <b>Файлов:</b> {totalFiles}";
+
+        await bot.EditMessageTextAsync(
+            chatId,
+            messageId,
+            messageText,
+            parseMode: ParseMode.Html,
+            replyMarkup: new InlineKeyboardMarkup(keyboardRows),
+            cancellationToken: ct
+        );
+    }
+
+    private async Task SendPreviewAlbumAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
+    {
+        var source = await db.StorageSources.FindAsync(new object[] { state.SourceId }, ct);
+        if (source == null) return;
+
+        // Берем до 8 фото из текущей страницы
+        var imageFiles = state.CachedFiles
+            .Where(f => ImageExtensions.Contains(f.FileExtension))
+            .Skip(state.FilePage * 6)
+            .Take(8)
+            .ToList();
+
+        if (!imageFiles.Any())
+        {
+            imageFiles = state.CachedFiles.Where(f => ImageExtensions.Contains(f.FileExtension)).Take(8).ToList();
+        }
+
+        if (!imageFiles.Any())
+        {
+            await bot.SendTextMessageAsync(chatId, "В этой папке нет доступных фото для альбома.", cancellationToken: ct);
+            return;
+        }
+
+        _logger.Log("Info", "Telegram", $"Генерация альбома миниатюр ({imageFiles.Count} фото) для @{user.DisplayName}", user.DisplayName);
+        var mediaList = new List<IAlbumInputMedia>();
+        var openStreams = new List<FileStream>();
+
+        try
+        {
+            foreach (var img in imageFiles)
+            {
+                var originalPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
+                if (System.IO.File.Exists(originalPath))
+                {
+                    // Создаем легковесную миниатюру на лету (800x800)
+                    var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(originalPath, 800, 800);
+                    var stream = System.IO.File.OpenRead(thumbPath);
+                    openStreams.Add(stream);
+
+                    var inputPhoto = new InputMediaPhoto(InputFile.FromStream(stream, img.FileName))
+                    {
+                        Caption = img.FileName
+                    };
+                    mediaList.Add(inputPhoto);
+                }
+            }
+
+            if (mediaList.Any())
+            {
+                await bot.SendMediaGroupAsync(chatId, mediaList, cancellationToken: ct);
+            }
+        }
+        finally
+        {
+            foreach (var stream in openStreams)
+            {
+                await stream.DisposeAsync();
+            }
+        }
+    }
+
+    private async Task SendSingleMediaFileAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, MediaItem item, CancellationToken ct)
+    {
+        using var db = new AppDbContext();
+        var source = await db.StorageSources.FindAsync(new object[] { item.StorageSourceId }, ct);
+        if (source == null) return;
+
+        var fullPath = Path.Combine(source.RootPath, item.RelativePath.Replace('/', '\\'));
+        if (!System.IO.File.Exists(fullPath)) return;
+
+        var ext = item.FileExtension.ToLowerInvariant();
+        var keyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("📥 Скачать оригинал файла", $"orig_file_{item.Id}") }
+        });
+
+        if (ImageExtensions.Contains(ext))
+        {
+            _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
+            // Создаем быструю миниатюру 1280x1280 на лету для мгновенной отправки
+            var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 1280, 1280);
+            await using var stream = System.IO.File.OpenRead(thumbPath);
+            await bot.SendPhotoAsync(
+                chatId,
+                InputFile.FromStream(stream, item.FileName),
+                caption: $"🖼 <b>{item.FileName}</b>\n📁 <code>{item.RelativePath}</code>\n💾 Размер: {item.FileSize / (1024 * 1024.0):F1} МБ",
+                parseMode: ParseMode.Html,
+                replyMarkup: keyboard,
+                cancellationToken: ct
+            );
+        }
+        else if (VideoExtensions.Contains(ext))
+        {
+            _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
+            await using var stream = System.IO.File.OpenRead(fullPath);
+            if (item.FileSize < 50 * 1024 * 1024)
+            {
+                await bot.SendVideoAsync(
+                    chatId,
+                    InputFile.FromStream(stream, item.FileName),
+                    caption: $"🎬 {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
+                    replyMarkup: keyboard,
+                    cancellationToken: ct
+                );
+            }
+            else
+            {
+                await bot.SendDocumentAsync(
+                    chatId,
+                    InputFile.FromStream(stream, item.FileName),
+                    caption: $"🎬 {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
+                    cancellationToken: ct
+                );
             }
         }
     }
@@ -351,8 +579,8 @@ public class TelegramBotService
 
         var allItems = await query.ToListAsync(ct);
 
-        // Фильтруем строго только фотографии (исключаем видео) и проверяем права
         var candidatePhotos = allItems
+            .Where(m => !IsIgnoredPath(m.RelativePath))
             .Where(m => ImageExtensions.Contains(m.FileExtension.ToLowerInvariant()))
             .Where(m => string.IsNullOrEmpty(folder) || m.RelativePath.StartsWith(folder, StringComparison.OrdinalIgnoreCase))
             .Where(m => _authService.CanAccessPath(user, m.StorageSourceId, m.RelativePath))
@@ -361,20 +589,8 @@ public class TelegramBotService
         if (candidatePhotos.Any())
         {
             var randomItem = candidatePhotos[Random.Shared.Next(candidatePhotos.Count)];
-            var fullPath = Path.Combine(randomItem.StorageSource.RootPath, randomItem.RelativePath.Replace('/', '\\'));
-
-            if (System.IO.File.Exists(fullPath))
-            {
-                _logger.Log("Info", "Telegram", $"Отправка случайного фото: {randomItem.FileName} для @{user.DisplayName}", user.DisplayName);
-                await using var stream = System.IO.File.OpenRead(fullPath);
-                await bot.SendPhotoAsync(
-                    chatId,
-                    InputFile.FromStream(stream, randomItem.FileName),
-                    caption: $"🎲 {randomItem.FileName}\n📁 {randomItem.RelativePath}",
-                    cancellationToken: ct
-                );
-                return;
-            }
+            await SendSingleMediaFileAsync(bot, chatId, user, randomItem, ct);
+            return;
         }
 
         await bot.SendTextMessageAsync(chatId, "В этой папке/источнике не найдено доступных фотографий.", cancellationToken: ct);

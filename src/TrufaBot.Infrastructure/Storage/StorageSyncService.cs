@@ -13,9 +13,20 @@ public class StorageSyncService : IStorageSyncService
         ".jpg", ".jpeg", ".png", ".webp", ".heic", ".mp4", ".mov", ".avi", ".mkv"
     };
 
+    private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp"
+    };
+
     public StorageSyncService(IAuditLogger logger)
     {
         _logger = logger;
+    }
+
+    public static bool IsIgnoredPath(string path)
+    {
+        var parts = path.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        return parts.Any(p => IgnoredDirectories.Contains(p) || p.StartsWith("@") || p.StartsWith("$") || (p.StartsWith(".") && p.Length > 1));
     }
 
     public async Task SynchronizeSourceAsync(int sourceId, CancellationToken ct = default)
@@ -37,7 +48,7 @@ public class StorageSyncService : IStorageSyncService
             .ToDictionaryAsync(m => m.RelativePath, ct);
 
         var diskFiles = Directory.EnumerateFiles(source.RootPath, "*.*", SearchOption.AllDirectories)
-            .Where(f => SupportedExtensions.Contains(Path.GetExtension(f)))
+            .Where(f => SupportedExtensions.Contains(Path.GetExtension(f)) && !IsIgnoredPath(f))
             .ToList();
 
         var diskRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -47,8 +58,9 @@ public class StorageSyncService : IStorageSyncService
         foreach (var filePath in diskFiles)
         {
             var relativePath = Path.GetRelativePath(source.RootPath, filePath).Replace('\\', '/');
-            diskRelativePaths.Add(relativePath);
+            if (IsIgnoredPath(relativePath)) continue;
 
+            diskRelativePaths.Add(relativePath);
             var fileInfo = new FileInfo(filePath);
 
             if (!existingItems.TryGetValue(relativePath, out var mediaItem))
