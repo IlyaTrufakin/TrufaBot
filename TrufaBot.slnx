@@ -1,2 +1,8 @@
 <Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TrufaBot.Application/TrufaBot.Application.csproj" />
+    <Project Path="src/TrufaBot.Domain/TrufaBot.Domain.csproj" />
+    <Project Path="src/TrufaBot.Infrastructure/TrufaBot.Infrastructure.csproj" />
+    <Project Path="src/TrufaBot.Presentation/TrufaBot.Presentation.csproj" />
+  </Folder>
 </Solution>
