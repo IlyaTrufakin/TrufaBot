@@ -172,7 +172,7 @@ public class TelegramBotService
             var buttons = new List<InlineKeyboardButton[]>();
             foreach (var src in sources)
             {
-                if (_authService.CanAccessPath(user, src.Id, "*"))
+                if (_authService.HasAnyAccessToSource(user, src.Id))
                 {
                     buttons.Add(new[] { InlineKeyboardButton.WithCallbackData($"📦 {src.Name}", $"select_src_{src.Id}") });
                 }
@@ -183,7 +183,7 @@ public class TelegramBotService
             await bot.EditMessageTextAsync(
                 chatId,
                 messageId,
-                "📂 Выберите источник медиафайлов:",
+                buttons.Count > 1 ? "📂 Выберите источник медиафайлов:" : "Вам пока не назначен доступ ни к одному источнику.",
                 replyMarkup: new InlineKeyboardMarkup(buttons),
                 cancellationToken: ct
             );
@@ -227,7 +227,6 @@ public class TelegramBotService
                 }
                 else
                 {
-                    // Вернуться к списку источников
                     await HandleCallbackQueryAsync(bot, new CallbackQuery { From = query.From, Data = "nav_sources", Message = query.Message }, user, db, ct);
                 }
             }
@@ -329,14 +328,14 @@ public class TelegramBotService
             fullTargetDir = source.RootPath;
         }
 
-        // 1. Считываем подпапки (исключая @Recycle и скрытые/системные папки)
+        // 1. Считываем подпапки (фильтрация прав через CanViewFolder)
         state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
-            .Where(rel => !IsIgnoredPath(rel) && _authService.CanAccessPath(user, state.SourceId, rel))
+            .Where(rel => !IsIgnoredPath(rel) && _authService.CanViewFolder(user, state.SourceId, rel))
             .OrderBy(d => d)
             .ToList();
 
-        // 2. Считываем файлы в текущей папке
+        // 2. Считываем файлы в текущей папке (фильтрация прав через CanAccessPath)
         var normalizedFolder = state.FolderPath.Trim('/');
         var allFolderFiles = await db.MediaItems
             .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
@@ -454,10 +453,9 @@ public class TelegramBotService
         var source = await db.StorageSources.FindAsync(new object[] { state.SourceId }, ct);
         if (source == null) return;
 
-        // Берем до 8 фото из текущей страницы
         var imageFiles = state.CachedFiles
             .Where(f => ImageExtensions.Contains(f.FileExtension))
-            .Skip(state.FilePage * 6)
+            .Skip(state.FilePage * 5)
             .Take(8)
             .ToList();
 
@@ -483,7 +481,6 @@ public class TelegramBotService
                 var originalPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
                 if (System.IO.File.Exists(originalPath))
                 {
-                    // Создаем легковесную миниатюру на лету (800x800)
                     var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(originalPath, 800, 800);
                     var stream = System.IO.File.OpenRead(thumbPath);
                     openStreams.Add(stream);
@@ -528,7 +525,6 @@ public class TelegramBotService
         if (ImageExtensions.Contains(ext))
         {
             _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
-            // Создаем быструю миниатюру 1280x1280 на лету для мгновенной отправки
             var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 1280, 1280);
             await using var stream = System.IO.File.OpenRead(thumbPath);
             await bot.SendPhotoAsync(

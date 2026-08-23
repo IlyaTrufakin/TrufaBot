@@ -55,6 +55,22 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private ObservableCollection<AuditLogEntry> _logs = new();
 
+    // --- УПРАВЛЕНИЕ ПРАВАМИ ВЫБРАННОГО ПОЛЬЗОВАТЕЛЯ ---
+    [ObservableProperty]
+    private User? _selectedUser;
+
+    [ObservableProperty]
+    private ObservableCollection<UserFolderPermission> _selectedUserPermissions = new();
+
+    [ObservableProperty]
+    private StorageSource? _selectedPermissionSource;
+
+    [ObservableProperty]
+    private string _selectedFolderToGrant = "*";
+
+    [ObservableProperty]
+    private ObservableCollection<string> _availableFoldersForSelectedSource = new();
+
     public MainViewModel(IAuditLogger auditLogger, TelegramBotService botService, IStorageSyncService syncService)
     {
         _auditLogger = auditLogger;
@@ -68,6 +84,60 @@ public partial class MainViewModel : ObservableObject
 
         LoadConfig();
         LoadData();
+    }
+
+    partial void OnSelectedUserChanged(User? value)
+    {
+        LoadPermissionsForSelectedUser();
+    }
+
+    partial void OnSelectedPermissionSourceChanged(StorageSource? value)
+    {
+        UpdateAvailableFoldersForSelectedSource();
+    }
+
+    private void LoadPermissionsForSelectedUser()
+    {
+        SelectedUserPermissions.Clear();
+        if (SelectedUser == null) return;
+
+        using var db = new AppDbContext();
+        var perms = db.UserFolderPermissions
+            .Include(p => p.StorageSource)
+            .Where(p => p.UserId == SelectedUser.Id)
+            .ToList();
+
+        SelectedUserPermissions = new ObservableCollection<UserFolderPermission>(perms);
+    }
+
+    private void UpdateAvailableFoldersForSelectedSource()
+    {
+        AvailableFoldersForSelectedSource.Clear();
+        AvailableFoldersForSelectedSource.Add("* (Весь источник полностью)");
+
+        if (SelectedPermissionSource == null)
+        {
+            SelectedFolderToGrant = "*";
+            return;
+        }
+
+        using var db = new AppDbContext();
+        var mediaFolders = db.MediaItems
+            .Where(m => m.StorageSourceId == SelectedPermissionSource.Id && !m.IsDeleted)
+            .Select(m => m.RelativePath)
+            .ToList()
+            .Select(rel => Path.GetDirectoryName(rel)?.Replace('\\', '/') ?? "")
+            .Where(f => !string.IsNullOrEmpty(f))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(f => f)
+            .ToList();
+
+        foreach (var folder in mediaFolders)
+        {
+            AvailableFoldersForSelectedSource.Add(folder);
+        }
+
+        SelectedFolderToGrant = "* (Весь источник полностью)";
     }
 
     private void LoadConfig()
@@ -113,6 +183,20 @@ public partial class MainViewModel : ObservableObject
 
         Sources = new ObservableCollection<StorageSource>(db.StorageSources.ToList());
         Users = new ObservableCollection<User>(db.Users.Include(u => u.Permissions).ToList());
+
+        if (SelectedUser != null)
+        {
+            SelectedUser = Users.FirstOrDefault(u => u.Id == SelectedUser.Id) ?? Users.FirstOrDefault();
+        }
+        else
+        {
+            SelectedUser = Users.FirstOrDefault();
+        }
+
+        if (SelectedPermissionSource == null && Sources.Any())
+        {
+            SelectedPermissionSource = Sources.FirstOrDefault();
+        }
 
         var historyLogs = db.AuditLogs.OrderByDescending(l => l.Timestamp).Take(100).ToList();
         Logs = new ObservableCollection<AuditLogEntry>(historyLogs);
@@ -272,6 +356,71 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private async Task ToggleUserAdminAsync(User? user)
+    {
+        if (user == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.Users.FindAsync(user.Id);
+        if (existing != null)
+        {
+            existing.IsAdmin = !existing.IsAdmin;
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Security", $"Пользователю '{existing.DisplayName}' {(existing.IsAdmin ? "выданы права администратора" : "сняты права администратора")}");
+            LoadData();
+        }
+    }
+
+    [RelayCommand]
+    private async Task AddPermissionForSelectedUserAsync()
+    {
+        if (SelectedUser == null || SelectedPermissionSource == null) return;
+
+        var pathToGrant = SelectedFolderToGrant.StartsWith("*") ? "*" : SelectedFolderToGrant.Trim();
+
+        using var db = new AppDbContext();
+        var exists = await db.UserFolderPermissions.AnyAsync(p =>
+            p.UserId == SelectedUser.Id &&
+            p.StorageSourceId == SelectedPermissionSource.Id &&
+            p.AllowedRelativePath == pathToGrant);
+
+        if (!exists)
+        {
+            var perm = new UserFolderPermission
+            {
+                UserId = SelectedUser.Id,
+                StorageSourceId = SelectedPermissionSource.Id,
+                AllowedRelativePath = pathToGrant,
+                IsRecursive = true,
+                IsDenied = false
+            };
+            db.UserFolderPermissions.Add(perm);
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Security", $"Пользователю '{SelectedUser.DisplayName}' разрешен доступ к: {SelectedPermissionSource.Name} -> {pathToGrant}");
+            LoadPermissionsForSelectedUser();
+        }
+    }
+
+    [RelayCommand]
+    private async Task DeletePermissionAsync(UserFolderPermission? perm)
+    {
+        if (perm == null) return;
+
+        using var db = new AppDbContext();
+        var existing = await db.UserFolderPermissions.FindAsync(perm.Id);
+        if (existing != null)
+        {
+            db.UserFolderPermissions.Remove(existing);
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Security", $"Удалено разрешение для пользователя");
+            LoadPermissionsForSelectedUser();
+        }
+    }
+
+    [RelayCommand]
     private async Task SyncAllSourcesAsync()
     {
         foreach (var source in Sources)
@@ -282,5 +431,6 @@ public partial class MainViewModel : ObservableObject
             }
         }
         LoadData();
+        UpdateAvailableFoldersForSelectedSource();
     }
 }

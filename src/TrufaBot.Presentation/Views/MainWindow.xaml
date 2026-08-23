@@ -1,17 +1,17 @@
 ﻿<Window x:Class="TrufaBot.Presentation.Views.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="TrufaBot — Домашний медиа-сервер" Height="720" Width="1100"
+        Title="TrufaBot — Домашний медиа-сервер" Height="760" Width="1180"
         WindowStartupLocation="CenterScreen" Background="#181825" Foreground="#FFFFFF">
     <Window.Resources>
-        <!-- Стили вкладок -->
+        <BooleanToVisibilityConverter x:Key="BoolToVisConverter"/>
+
         <Style TargetType="TabItem">
             <Setter Property="FontSize" Value="14"/>
             <Setter Property="Padding" Value="16,10"/>
             <Setter Property="Foreground" Value="#CDD6F4"/>
         </Style>
         
-        <!-- Стили полей ввода -->
         <Style TargetType="TextBox">
             <Setter Property="Background" Value="#11111B"/>
             <Setter Property="Foreground" Value="#FFFFFF"/>
@@ -20,7 +20,14 @@
             <Setter Property="FontSize" Value="13"/>
         </Style>
 
-        <!-- Стиль заголовков таблиц -->
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#11111B"/>
+            <Setter Property="Foreground" Value="#11111B"/>
+            <Setter Property="BorderBrush" Value="#585B70"/>
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+
         <Style TargetType="DataGridColumnHeader">
             <Setter Property="Background" Value="#313244"/>
             <Setter Property="Foreground" Value="#FFFFFF"/>
@@ -30,7 +37,6 @@
             <Setter Property="BorderThickness" Value="0,0,1,1"/>
         </Style>
 
-        <!-- Общий стиль DataGrid -->
         <Style TargetType="DataGrid">
             <Setter Property="Background" Value="#181825"/>
             <Setter Property="Foreground" Value="#FFFFFF"/>
@@ -43,7 +49,6 @@
             <Setter Property="RowHeight" Value="32"/>
         </Style>
 
-        <!-- Стиль ячеек DataGrid -->
         <Style TargetType="DataGridCell">
             <Setter Property="Foreground" Value="#FFFFFF"/>
             <Setter Property="Padding" Value="8,4"/>
@@ -168,7 +173,7 @@
                 </Grid>
             </TabItem>
 
-            <!-- Вкладка 3: Пользователи и Права -->
+            <!-- Вкладка 3: Пользователи и Права Доступа -->
             <TabItem Header="👥 Пользователи и Доступ">
                 <Grid Margin="10">
                     <Grid.RowDefinitions>
@@ -176,6 +181,7 @@
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
 
+                    <!-- Добавление нового пользователя -->
                     <Border Grid.Row="0" Background="#313244" CornerRadius="6" Padding="10" Margin="0,0,0,10">
                         <Grid>
                             <Grid.ColumnDefinitions>
@@ -197,33 +203,141 @@
                         </Grid>
                     </Border>
 
-                    <DataGrid Grid.Row="1" ItemsSource="{Binding Users}" AutoGenerateColumns="False" 
-                              IsReadOnly="True">
-                        <DataGrid.Columns>
-                            <DataGridTextColumn Header="Telegram ID" Binding="{Binding TelegramUserId}" Width="130"/>
-                            <DataGridTextColumn Header="Имя" Binding="{Binding DisplayName}" Width="180"/>
-                            <DataGridTextColumn Header="Username" Binding="{Binding Username}" Width="140"/>
-                            <DataGridCheckBoxColumn Header="Активен" Binding="{Binding IsActive}" Width="80"/>
-                            <DataGridCheckBoxColumn Header="Админ" Binding="{Binding IsAdmin}" Width="80"/>
-                            <DataGridTextColumn Header="Дата добавления" Binding="{Binding CreatedAt, StringFormat='{}{0:dd.MM.yyyy}'}" Width="130"/>
-                            <DataGridTemplateColumn Header="Действия" Width="180">
-                                <DataGridTemplateColumn.CellTemplate>
-                                    <DataTemplate>
-                                        <StackPanel Orientation="Horizontal">
-                                            <Button Content="Вкл/Выкл" 
-                                                    Command="{Binding DataContext.ToggleUserActiveCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                                    CommandParameter="{Binding}" 
-                                                    Padding="8,2" Margin="0,0,6,0" Background="#F9E2AF" Foreground="#11111B"/>
-                                            <Button Content="🗑 Удалить" 
-                                                    Command="{Binding DataContext.DeleteUserCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                                    CommandParameter="{Binding}" 
-                                                    Padding="8,2" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold"/>
-                                        </StackPanel>
-                                    </DataTemplate>
-                                </DataGridTemplateColumn.CellTemplate>
-                            </DataGridTemplateColumn>
-                        </DataGrid.Columns>
-                    </DataGrid>
+                    <!-- Двухпанельный интерфейс: Список пользователей + Настройка прав -->
+                    <Grid Grid.Row="1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="480"/>
+                            <ColumnDefinition Width="10"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Левая панель: Пользователи -->
+                        <Border Grid.Column="0" Background="#1E1E2E" CornerRadius="6" Padding="10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <TextBlock Text="👥 Список пользователей (выберите для настройки):" FontWeight="Bold" Foreground="#89B4FA" Margin="0,0,0,8"/>
+                                
+                                <DataGrid Grid.Row="1" ItemsSource="{Binding Users}" SelectedItem="{Binding SelectedUser, Mode=TwoWay}"
+                                          AutoGenerateColumns="False" IsReadOnly="True">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="Telegram ID" Binding="{Binding TelegramUserId}" Width="110"/>
+                                        <DataGridTextColumn Header="Имя" Binding="{Binding DisplayName}" Width="120"/>
+                                        <DataGridCheckBoxColumn Header="Админ" Binding="{Binding IsAdmin}" Width="65"/>
+                                        <DataGridCheckBoxColumn Header="Актив" Binding="{Binding IsActive}" Width="60"/>
+                                        <DataGridTemplateColumn Header="Действия" Width="*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Button Content="⭐" ToolTip="Переключить права администратора"
+                                                                Command="{Binding DataContext.ToggleUserAdminCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                                CommandParameter="{Binding}" 
+                                                                Padding="5,1" Margin="0,0,4,0" Background="#F9E2AF" Foreground="#11111B"/>
+                                                        <Button Content="Вкл/Выкл" 
+                                                                Command="{Binding DataContext.ToggleUserActiveCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                                CommandParameter="{Binding}" 
+                                                                Padding="5,1" Margin="0,0,4,0" Background="#A6E3A1" Foreground="#11111B"/>
+                                                        <Button Content="🗑" ToolTip="Удалить пользователя"
+                                                                Command="{Binding DataContext.DeleteUserCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                                CommandParameter="{Binding}" 
+                                                                Padding="5,1" Background="#F38BA8" Foreground="#11111B"/>
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </Border>
+
+                        <!-- Правая панель: Настройка прав к папкам -->
+                        <Border Grid.Column="2" Background="#1E1E2E" CornerRadius="6" Padding="12">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+
+                                <!-- Заголовок выбранного пользователя -->
+                                <StackPanel Grid.Row="0" Margin="0,0,0,10">
+                                    <TextBlock Text="🔒 Права доступа к папкам для пользователя:" FontWeight="Bold" FontSize="14" Foreground="#89B4FA"/>
+                                    <TextBlock Margin="0,4,0,0" FontSize="13">
+                                        <Run Text="Пользователь: " Foreground="#A6ADC8"/>
+                                        <Run Text="{Binding SelectedUser.DisplayName, FallbackValue='(Не выбран)'}" FontWeight="Bold" Foreground="#A6E3A1"/>
+                                        <Run Text=" | Telegram ID: " Foreground="#A6ADC8"/>
+                                        <Run Text="{Binding SelectedUser.TelegramUserId, FallbackValue='—'}" Foreground="#F9E2AF"/>
+                                    </TextBlock>
+                                </StackPanel>
+
+                                <!-- Если админ - предупреждение о полном доступе -->
+                                <Border Grid.Row="1" Background="#45475A" CornerRadius="4" Padding="8" Margin="0,0,0,10"
+                                        Visibility="{Binding SelectedUser.IsAdmin, Converter={StaticResource BoolToVisConverter}}">
+                                    <TextBlock Text="⭐ Этот пользователь — Администратор. У него есть полный доступ ко всем дискам, папкам и файлам." Foreground="#F9E2AF" FontWeight="SemiBold"/>
+                                </Border>
+
+                                <!-- Форма добавления нового разрешения -->
+                                <Border Grid.Row="2" Background="#313244" CornerRadius="6" Padding="10" Margin="0,0,0,10">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Grid.Row="0" Text="➕ Назначить доступ к источнику / папке:" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,0,0,8"/>
+                                        <Grid Grid.Row="1">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="160"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            
+                                            <!-- Выбор источника -->
+                                            <ComboBox Grid.Column="0" ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedPermissionSource}" 
+                                                      DisplayMemberPath="Name" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                                            
+                                            <!-- Выбор папки -->
+                                            <ComboBox Grid.Column="1" ItemsSource="{Binding AvailableFoldersForSelectedSource}" 
+                                                      SelectedItem="{Binding SelectedFolderToGrant, Mode=TwoWay}"
+                                                      IsEditable="True" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                                            
+                                            <!-- Кнопка добавить -->
+                                            <Button Grid.Column="2" Content="➕ Разрешить" Command="{Binding AddPermissionForSelectedUserCommand}" 
+                                                    Padding="12,6" Background="#A6E3A1" Foreground="#11111B" FontWeight="Bold"/>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+
+                                <!-- Список назначенных прав -->
+                                <Grid Grid.Row="3">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Text="Разрешенные папки и источники:" FontWeight="Bold" Foreground="#CDD6F4" Margin="0,0,0,6"/>
+                                    <DataGrid Grid.Row="1" ItemsSource="{Binding SelectedUserPermissions}" AutoGenerateColumns="False" IsReadOnly="True">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Источник" Binding="{Binding StorageSource.Name}" Width="140"/>
+                                            <DataGridTextColumn Header="Разрешенный путь" Binding="{Binding AllowedRelativePath}" Width="*"/>
+                                            <DataGridCheckBoxColumn Header="Вложенные" Binding="{Binding IsRecursive}" Width="90"/>
+                                            <DataGridTemplateColumn Header="Действие" Width="100">
+                                                <DataGridTemplateColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <Button Content="🗑 Отозвать" 
+                                                                Command="{Binding DataContext.DeletePermissionCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                                CommandParameter="{Binding}" 
+                                                                Padding="6,2" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold"/>
+                                                    </DataTemplate>
+                                                </DataGridTemplateColumn.CellTemplate>
+                                            </DataGridTemplateColumn>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </Grid>
+                            </Grid>
+                        </Border>
+                    </Grid>
                 </Grid>
             </TabItem>
         </TabControl>
