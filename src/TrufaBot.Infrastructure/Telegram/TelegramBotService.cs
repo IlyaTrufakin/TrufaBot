@@ -28,7 +28,7 @@ public class TelegramBotService
 {
     private const long MaxTelegramUploadBytes = 49 * 1024 * 1024;
     private const int DirPageSize = 20;   // 20 папок на страницу
-    private const int FilePageSize = 20;  // 20 миниатюр фото на страницу
+    private const int FilePageSize = 10;  // 10 фото на страницу (по 1 в строку лентой)
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -375,7 +375,7 @@ public class TelegramBotService
                 if (item != null && !item.IsDeleted && _authService.CanAccessPath(user, item.StorageSourceId, item.RelativePath))
                 {
                     var fullPath = Path.Combine(item.StorageSource.RootPath, item.RelativePath.Replace('/', '\\'));
-                    if (System.IO.File.Exists(fullPath))
+                    if (File.Exists(fullPath))
                     {
                         if (item.FileSize > MaxTelegramUploadBytes)
                         {
@@ -389,12 +389,15 @@ public class TelegramBotService
                             return;
                         }
 
-                        _logger.Log("Info", "Telegram", $"Отправка оригинала: {item.FileName} для @{user.DisplayName}", user.DisplayName);
-                        await using var stream = System.IO.File.OpenRead(fullPath);
+                        _logger.Log("Info", "Telegram", $"Отправка полного качества (оригинал): {item.FileName} для @{user.DisplayName}", user.DisplayName);
+                        await using var stream = File.OpenRead(fullPath);
+
+                        // Отправляем как документ (100% исходное качество без пересжатия Telegram)
                         await bot.SendDocument(
                             chatId,
                             InputFile.FromStream(stream, item.FileName),
-                            caption: $"📥 Оригинал: {item.FileName} ({item.FileSize / (1024 * 1024.0):F1} МБ)",
+                            caption: $"📥 <b>{item.FileName}</b>\n💾 Размер оригинала: {item.FileSize / (1024 * 1024.0):F2} МБ",
+                            parseMode: ParseMode.Html,
                             cancellationToken: ct
                         );
                     }
@@ -448,7 +451,7 @@ public class TelegramBotService
 
         var hasPhotos = state.CachedFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
 
-        // Если в открытой папке есть фотографии -> СРАЗУ отправляем галерею миниатюр!
+        // Если в открытой папке есть фотографии -> СРАЗУ отправляем ленту фото по 10 шт
         if (hasPhotos)
         {
             await SendPhotoGalleryPageAsync(bot, chatId, user, db, state, ct);
@@ -557,15 +560,15 @@ public class TelegramBotService
 
         var pagePhotos = allPhotos.Skip(state.FilePage * FilePageSize).Take(FilePageSize).ToList();
 
-        _logger.Log("Info", "Telegram", $"Параллельная генерация {pagePhotos.Count} миниатюр (Стр. {state.FilePage + 1}/{totalPhotoPages}) для @{user.DisplayName}", user.DisplayName);
+        _logger.Log("Info", "Telegram", $"Отправка ленты из {pagePhotos.Count} миниатюр (Стр. {state.FilePage + 1}/{totalPhotoPages}) для @{user.DisplayName}", user.DisplayName);
 
-        // 1. Быстрая параллельная генерация всех миниатюр на всех ядрах процессора
+        // 1. Предварительная быстрая параллельная генерация миниатюр
         var thumbTasks = pagePhotos.Select(async img =>
         {
             var origPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
             if (File.Exists(origPath))
             {
-                var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(origPath, 600, 600);
+                var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(origPath, 800, 800);
                 return (Item: img, ThumbPath: thumbPath);
             }
             return (Item: img, ThumbPath: string.Empty);
@@ -575,21 +578,37 @@ public class TelegramBotService
             .Where(t => !string.IsNullOrEmpty(t.ThumbPath))
             .ToList();
 
-        // 2. Telegram MediaGroup принимает максимум 10 фото на одну группу.
-        // Отправляем оба батча (до 10 + до 10) ПАРАЛЛЕЛЬНО без паузы!
-        var batch1 = readyThumbs.Take(10).ToList();
-        var batch2 = readyThumbs.Skip(10).Take(10).ToList();
-
-        var uploadTasks = new List<Task>();
-        uploadTasks.Add(SendMediaGroupBatchAsync(bot, chatId, batch1, ct));
-        if (batch2.Any())
+        // 2. Отправляем фотографии плавно по 1 штуке в строку (лента)
+        foreach (var entry in readyThumbs)
         {
-            uploadTasks.Add(SendMediaGroupBatchAsync(bot, chatId, batch2, ct));
+            try
+            {
+                var item = entry.Item;
+                var singlePhotoKeyboard = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData($"🔍 Полное качество ({item.FileSize / (1024 * 1024.0):F1} МБ)", $"orig_file_{item.Id}")
+                    }
+                });
+
+                await using var stream = File.OpenRead(entry.ThumbPath);
+                await bot.SendPhoto(
+                    chatId,
+                    InputFile.FromStream(stream, item.FileName),
+                    caption: $"🖼 <b>{item.FileName}</b>",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: singlePhotoKeyboard,
+                    cancellationToken: ct
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.Log("Warning", "Telegram", $"Ошибка отправки миниатюры '{entry.Item.FileName}': {ex.Message}");
+            }
         }
 
-        await Task.WhenAll(uploadTasks);
-
-        // 3. Клавиатура навигации
+        // 3. Панель навигации под лентой из 10 фото
         var navButtons = new List<InlineKeyboardButton[]>();
 
         // Если в этой папке также есть подпапки, выводим их
@@ -607,20 +626,20 @@ public class TelegramBotService
             }
         }
 
-        // Строка пагинации фото
+        // Строка пагинации фото по 10 шт
         var pageRow = new List<InlineKeyboardButton>();
         if (state.FilePage > 0)
         {
-            pageRow.Add(InlineKeyboardButton.WithCallbackData("⬅️ 20 фото", $"file_page_{state.FilePage - 1}"));
+            pageRow.Add(InlineKeyboardButton.WithCallbackData("⬅️ Предыдущие 10", $"file_page_{state.FilePage - 1}"));
         }
-        pageRow.Add(InlineKeyboardButton.WithCallbackData($"Фото {state.FilePage + 1}/{totalPhotoPages}", $"file_page_{state.FilePage}"));
+        pageRow.Add(InlineKeyboardButton.WithCallbackData($"Стр. {state.FilePage + 1}/{totalPhotoPages}", $"file_page_{state.FilePage}"));
         if (state.FilePage < totalPhotoPages - 1)
         {
-            pageRow.Add(InlineKeyboardButton.WithCallbackData("20 фото ➡️", $"file_page_{state.FilePage + 1}"));
+            pageRow.Add(InlineKeyboardButton.WithCallbackData("Следующие 10 ➡️", $"file_page_{state.FilePage + 1}"));
         }
         navButtons.Add(pageRow.ToArray());
 
-        // Навигация
+        // Навигация вверх и случайное
         navButtons.Add(new[]
         {
             InlineKeyboardButton.WithCallbackData("⬆️ Вверх", "nav_up"),
@@ -635,8 +654,8 @@ public class TelegramBotService
         int startItemIndex = state.FilePage * FilePageSize + 1;
         int endItemIndex = state.FilePage * FilePageSize + readyThumbs.Count;
         var folderTitle = string.IsNullOrEmpty(state.FolderPath) ? source.Name : Path.GetFileName(state.FolderPath);
-        var captionText = $"📁 <b>{folderTitle}</b> | Фото {startItemIndex}–{endItemIndex} из {totalPhotos}\n" +
-                          $"<i>(Стр. {state.FilePage + 1} из {totalPhotoPages})</i>";
+        var captionText = $"📁 <b>{folderTitle}</b> | Показаны фото {startItemIndex}–{endItemIndex} из {totalPhotos}\n" +
+                          $"<i>(Страница {state.FilePage + 1} из {totalPhotoPages} по {FilePageSize} шт)</i>";
 
         await bot.SendMessage(
             chatId,
@@ -647,38 +666,6 @@ public class TelegramBotService
         );
     }
 
-    private async Task SendMediaGroupBatchAsync(ITelegramBotClient bot, long chatId, List<(MediaItem Item, string ThumbPath)> batch, CancellationToken ct)
-    {
-        if (!batch.Any()) return;
-
-        var mediaList = new List<IAlbumInputMedia>();
-        var openStreams = new List<FileStream>();
-
-        try
-        {
-            foreach (var item in batch)
-            {
-                var stream = File.OpenRead(item.ThumbPath);
-                openStreams.Add(stream);
-
-                var inputPhoto = new InputMediaPhoto(InputFile.FromStream(stream, item.Item.FileName))
-                {
-                    Caption = item.Item.FileName
-                };
-                mediaList.Add(inputPhoto);
-            }
-
-            await bot.SendMediaGroup(chatId, mediaList, cancellationToken: ct);
-        }
-        finally
-        {
-            foreach (var stream in openStreams)
-            {
-                await stream.DisposeAsync();
-            }
-        }
-    }
-
     private async Task SendSingleMediaFileAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, MediaItem item, CancellationToken ct)
     {
         using var db = new AppDbContext();
@@ -686,7 +673,7 @@ public class TelegramBotService
         if (source == null) return;
 
         var fullPath = Path.Combine(source.RootPath, item.RelativePath.Replace('/', '\\'));
-        if (!System.IO.File.Exists(fullPath)) return;
+        if (!File.Exists(fullPath)) return;
 
         var ext = item.FileExtension.ToLowerInvariant();
 
@@ -694,7 +681,7 @@ public class TelegramBotService
         {
             new[]
             {
-                InlineKeyboardButton.WithCallbackData("📥 Оригинал", $"orig_file_{item.Id}"),
+                InlineKeyboardButton.WithCallbackData($"🔍 Полное качество ({item.FileSize / (1024 * 1024.0):F1} МБ)", $"orig_file_{item.Id}"),
                 InlineKeyboardButton.WithCallbackData("🎲 Еще случайное", "rand_current_folder")
             },
             new[]
@@ -708,7 +695,7 @@ public class TelegramBotService
         {
             _logger.Log("Info", "Telegram", $"Отправка фото: {item.FileName} для @{user.DisplayName}", user.DisplayName);
             var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 1280, 1280);
-            await using var stream = System.IO.File.OpenRead(thumbPath);
+            await using var stream = File.OpenRead(thumbPath);
             await bot.SendPhoto(
                 chatId,
                 InputFile.FromStream(stream, item.FileName),
@@ -737,7 +724,7 @@ public class TelegramBotService
             }
 
             _logger.Log("Info", "Telegram", $"Отправка видео: {item.FileName} для @{user.DisplayName}", user.DisplayName);
-            await using var stream = System.IO.File.OpenRead(fullPath);
+            await using var stream = File.OpenRead(fullPath);
             await bot.SendVideo(
                 chatId,
                 InputFile.FromStream(stream, item.FileName),
