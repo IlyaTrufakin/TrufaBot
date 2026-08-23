@@ -27,6 +27,8 @@ public class UserBrowseState
 public class TelegramBotService
 {
     private const long MaxTelegramUploadBytes = 49 * 1024 * 1024;
+    private const int DirPageSize = 20;   // 20 папок на страницу
+    private const int FilePageSize = 20;  // 20 миниатюр фото на страницу
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -40,7 +42,7 @@ public class TelegramBotService
 
     private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
     {
-        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp"
+        "@recycle", "#recycle", "$recycle.bin", "system volume information", "@eadir", ".git", ".vs", ".sync", ".tmp", "thumbnails"
     };
 
     private readonly IAuditLogger _logger;
@@ -330,12 +332,19 @@ public class TelegramBotService
                 await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
             }
         }
+        else if (data == "show_photos_gallery")
+        {
+            if (_userSessions.TryGetValue(userId, out var state))
+            {
+                await SendPhotoGalleryPageAsync(bot, chatId, user, db, state, ct);
+            }
+        }
         else if (data.StartsWith("file_page_"))
         {
             if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("file_page_".Length), out int newFilePage))
             {
                 state.FilePage = newFilePage;
-                await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
+                await SendPhotoGalleryPageAsync(bot, chatId, user, db, state, ct);
             }
         }
         else if (data == "rand_current_folder")
@@ -343,24 +352,6 @@ public class TelegramBotService
             if (_userSessions.TryGetValue(userId, out var state))
             {
                 await SendRandomPhotoAsync(bot, chatId, user, db, state.SourceId, state.FolderPath, ct);
-            }
-        }
-        else if (data == "preview_album")
-        {
-            if (_userSessions.TryGetValue(userId, out var state))
-            {
-                await SendPreviewAlbumAsync(bot, chatId, user, db, state, ct);
-            }
-        }
-        else if (data.StartsWith("view_file_"))
-        {
-            if (_userSessions.TryGetValue(userId, out var state) && int.TryParse(data.Substring("view_file_".Length), out int fileIndex))
-            {
-                if (fileIndex >= 0 && fileIndex < state.CachedFiles.Count)
-                {
-                    var file = state.CachedFiles[fileIndex];
-                    await SendSingleMediaFileAsync(bot, chatId, user, file, ct);
-                }
             }
         }
         else if (data.StartsWith("open_parent_folder_"))
@@ -441,12 +432,14 @@ public class TelegramBotService
             fullTargetDir = source.RootPath;
         }
 
+        // Подпапки
         state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
             .Where(rel => !IsIgnoredPath(rel) && _authService.CanViewFolder(user, state.SourceId, rel))
             .OrderBy(d => d)
             .ToList();
 
+        // Файлы
         var normalizedFolder = state.FolderPath.Trim('/');
         var allFolderFiles = await db.MediaItems
             .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
@@ -465,30 +458,38 @@ public class TelegramBotService
 
         var keyboardRows = new List<InlineKeyboardButton[]>();
 
-        var quickActions = new List<InlineKeyboardButton>();
-        bool hasImages = state.CachedFiles.Any(f => ImageExtensions.Contains(f.FileExtension));
-        if (hasImages)
+        // 1. Кнопка галереи миниатюр (если есть фотографии)
+        var totalImagesCount = state.CachedFiles.Count(f => ImageExtensions.Contains(f.FileExtension));
+        if (totalImagesCount > 0)
         {
-            quickActions.Add(InlineKeyboardButton.WithCallbackData("📸 Предпросмотр (альбом)", "preview_album"));
-            quickActions.Add(InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "rand_current_folder"));
-        }
-        if (quickActions.Count > 0)
-        {
-            keyboardRows.Add(quickActions.ToArray());
+            keyboardRows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"🖼 Смотреть фото (20 миниатюр) 📸", "show_photos_gallery"),
+                InlineKeyboardButton.WithCallbackData("🎲 Случайное", "rand_current_folder")
+            });
         }
 
-        const int dirPageSize = 6;
+        // --- СПИСОК ПОДПАПОК (По 20 папок на страницу, по 2 кнопки в строке) ---
         int totalDirs = state.CachedSubDirs.Count;
-        int totalDirPages = (int)Math.Ceiling(totalDirs / (double)dirPageSize);
+        int totalDirPages = (int)Math.Ceiling(totalDirs / (double)DirPageSize);
         if (state.DirPage >= totalDirPages && totalDirPages > 0) state.DirPage = totalDirPages - 1;
         if (state.DirPage < 0) state.DirPage = 0;
 
-        var currentDirSlice = state.CachedSubDirs.Skip(state.DirPage * dirPageSize).Take(dirPageSize).ToList();
-        for (int i = 0; i < currentDirSlice.Count; i++)
+        var currentDirSlice = state.CachedSubDirs.Skip(state.DirPage * DirPageSize).Take(DirPageSize).ToList();
+        for (int i = 0; i < currentDirSlice.Count; i += 2)
         {
-            int globalIndex = state.DirPage * dirPageSize + i;
-            var dirName = Path.GetFileName(currentDirSlice[i]);
-            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"📁 {dirName}", $"enter_dir_{globalIndex}") });
+            var row = new List<InlineKeyboardButton>();
+            int idx1 = state.DirPage * DirPageSize + i;
+            var dirName1 = Path.GetFileName(currentDirSlice[i]);
+            row.Add(InlineKeyboardButton.WithCallbackData($"📁 {dirName1}", $"enter_dir_{idx1}"));
+
+            if (i + 1 < currentDirSlice.Count)
+            {
+                int idx2 = state.DirPage * DirPageSize + i + 1;
+                var dirName2 = Path.GetFileName(currentDirSlice[i + 1]);
+                row.Add(InlineKeyboardButton.WithCallbackData($"📁 {dirName2}", $"enter_dir_{idx2}"));
+            }
+            keyboardRows.Add(row.ToArray());
         }
 
         if (totalDirPages > 1)
@@ -502,32 +503,7 @@ public class TelegramBotService
             keyboardRows.Add(dirNav.ToArray());
         }
 
-        const int filePageSize = 5;
-        int totalFiles = state.CachedFiles.Count;
-        int totalFilePages = (int)Math.Ceiling(totalFiles / (double)filePageSize);
-        if (state.FilePage >= totalFilePages && totalFilePages > 0) state.FilePage = totalFilePages - 1;
-        if (state.FilePage < 0) state.FilePage = 0;
-
-        var currentFileSlice = state.CachedFiles.Skip(state.FilePage * filePageSize).Take(filePageSize).ToList();
-        for (int i = 0; i < currentFileSlice.Count; i++)
-        {
-            int globalFileIndex = state.FilePage * filePageSize + i;
-            var file = currentFileSlice[i];
-            var icon = ImageExtensions.Contains(file.FileExtension) ? "🖼" : (VideoExtensions.Contains(file.FileExtension) ? "🎬" : "📄");
-            keyboardRows.Add(new[] { InlineKeyboardButton.WithCallbackData($"{icon} {file.FileName}", $"view_file_{globalFileIndex}") });
-        }
-
-        if (totalFilePages > 1)
-        {
-            var fileNav = new List<InlineKeyboardButton>();
-            if (state.FilePage > 0)
-                fileNav.Add(InlineKeyboardButton.WithCallbackData("⬅️ Фото", $"file_page_{state.FilePage - 1}"));
-            fileNav.Add(InlineKeyboardButton.WithCallbackData($"Файлы {state.FilePage + 1}/{totalFilePages}", $"file_page_{state.FilePage}"));
-            if (state.FilePage < totalFilePages - 1)
-                fileNav.Add(InlineKeyboardButton.WithCallbackData("Фото ➡️", $"file_page_{state.FilePage + 1}"));
-            keyboardRows.Add(fileNav.ToArray());
-        }
-
+        // Навигация вверх / к источникам
         if (!string.IsNullOrEmpty(state.FolderPath))
         {
             keyboardRows.Add(new[]
@@ -543,7 +519,7 @@ public class TelegramBotService
 
         var folderTitle = string.IsNullOrEmpty(state.FolderPath) ? source.Name : Path.GetFileName(state.FolderPath);
         var messageText = $"📁 <b>Папка:</b> {folderTitle}\n" +
-                          $"📂 <b>Подпапок:</b> {totalDirs} | 🖼 <b>Файлов:</b> {totalFiles}";
+                          $"📂 <b>Подпапок:</b> {totalDirs} (по {DirPageSize} на стр.) | 🖼 <b>Фотографий:</b> {totalImagesCount}";
 
         if (messageId.HasValue)
         {
@@ -561,41 +537,98 @@ public class TelegramBotService
         }
     }
 
-    private async Task SendPreviewAlbumAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
+    private async Task SendPhotoGalleryPageAsync(ITelegramBotClient bot, long chatId, Domain.Entities.User user, AppDbContext db, UserBrowseState state, CancellationToken ct)
     {
         var source = await db.StorageSources.FindAsync(new object[] { state.SourceId }, ct);
         if (source == null) return;
 
-        var imageFiles = state.CachedFiles
+        var allPhotos = state.CachedFiles
             .Where(f => ImageExtensions.Contains(f.FileExtension))
-            .Skip(state.FilePage * 5)
-            .Take(8)
             .ToList();
 
-        if (!imageFiles.Any())
+        if (!allPhotos.Any())
         {
-            imageFiles = state.CachedFiles.Where(f => ImageExtensions.Contains(f.FileExtension)).Take(8).ToList();
-        }
-
-        if (!imageFiles.Any())
-        {
-            await bot.SendMessage(chatId, "В этой папке нет доступных фото для альбома.", cancellationToken: ct);
+            await bot.SendMessage(chatId, "В этой папке нет доступных фото.", replyMarkup: GetPersistentMenuKeyboard(), cancellationToken: ct);
             return;
         }
 
-        _logger.Log("Info", "Telegram", $"Генерация альбома миниатюр ({imageFiles.Count} фото) для @{user.DisplayName}", user.DisplayName);
+        int totalPhotos = allPhotos.Count;
+        int totalPhotoPages = (int)Math.Ceiling(totalPhotos / (double)FilePageSize);
+        if (state.FilePage >= totalPhotoPages && totalPhotoPages > 0) state.FilePage = totalPhotoPages - 1;
+        if (state.FilePage < 0) state.FilePage = 0;
+
+        var pagePhotos = allPhotos.Skip(state.FilePage * FilePageSize).Take(FilePageSize).ToList();
+
+        _logger.Log("Info", "Telegram", $"Генерация галереи из {pagePhotos.Count} миниатюр (Стр. {state.FilePage + 1}/{totalPhotoPages}) для @{user.DisplayName}", user.DisplayName);
+
+        // Telegram MediaGroup принимает до 10 фото в одной группе (коллаже).
+        // Поэтому для 20 фото отправляем 2 группы (по 10 шт), Telegram красиво располагает их сеткой по 2-3 фото в ряд!
+        var batch1 = pagePhotos.Take(10).ToList();
+        var batch2 = pagePhotos.Skip(10).Take(10).ToList();
+
+        await SendMediaBatchAsync(bot, chatId, source, batch1, ct);
+        if (batch2.Any())
+        {
+            await SendMediaBatchAsync(bot, chatId, source, batch2, ct);
+        }
+
+        // Клавиатура пагинации по 20 фото
+        var navButtons = new List<InlineKeyboardButton[]>();
+        var pageRow = new List<InlineKeyboardButton>();
+
+        if (state.FilePage > 0)
+        {
+            pageRow.Add(InlineKeyboardButton.WithCallbackData("⬅️ 20 фото", $"file_page_{state.FilePage - 1}"));
+        }
+        pageRow.Add(InlineKeyboardButton.WithCallbackData($"Фото {state.FilePage + 1}/{totalPhotoPages}", $"file_page_{state.FilePage}"));
+        if (state.FilePage < totalPhotoPages - 1)
+        {
+            pageRow.Add(InlineKeyboardButton.WithCallbackData("20 фото ➡️", $"file_page_{state.FilePage + 1}"));
+        }
+        navButtons.Add(pageRow.ToArray());
+
+        navButtons.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("📁 К списку папок", "nav_up"),
+            InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "rand_current_folder")
+        });
+
+        navButtons.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu")
+        });
+
+        int startItemIndex = state.FilePage * FilePageSize + 1;
+        int endItemIndex = state.FilePage * FilePageSize + pagePhotos.Count;
+        var captionText = $"🖼 <b>Миниатюры фото:</b> {startItemIndex}–{endItemIndex} из {totalPhotos}\n" +
+                          $"<i>Страница {state.FilePage + 1} из {totalPhotoPages} (по {FilePageSize} шт)</i>";
+
+        await bot.SendMessage(
+            chatId,
+            captionText,
+            parseMode: ParseMode.Html,
+            replyMarkup: new InlineKeyboardMarkup(navButtons),
+            cancellationToken: ct
+        );
+    }
+
+    private async Task SendMediaBatchAsync(ITelegramBotClient bot, long chatId, StorageSource source, List<MediaItem> items, CancellationToken ct)
+    {
+        if (!items.Any()) return;
+
         var mediaList = new List<IAlbumInputMedia>();
         var openStreams = new List<FileStream>();
 
         try
         {
-            foreach (var img in imageFiles)
+            foreach (var img in items)
             {
                 var originalPath = Path.Combine(source.RootPath, img.RelativePath.Replace('/', '\\'));
-                if (System.IO.File.Exists(originalPath))
+                if (File.Exists(originalPath))
                 {
-                    var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(originalPath, 800, 800);
-                    var stream = System.IO.File.OpenRead(thumbPath);
+                    // Создаем оптимизированную миниатюру 600x600 px для коллажа сеткой
+                    var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(originalPath, 600, 600);
+                    var stream = File.OpenRead(thumbPath);
                     openStreams.Add(stream);
 
                     var inputPhoto = new InputMediaPhoto(InputFile.FromStream(stream, img.FileName))
@@ -609,27 +642,6 @@ public class TelegramBotService
             if (mediaList.Any())
             {
                 await bot.SendMediaGroup(chatId, mediaList, cancellationToken: ct);
-
-                var albumNavKeyboard = new InlineKeyboardMarkup(new[]
-                {
-                    new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData("📁 Открыть эту папку", $"open_parent_folder_{imageFiles.First().Id}"),
-                        InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "rand_current_folder")
-                    },
-                    new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu")
-                    }
-                });
-
-                await bot.SendMessage(
-                    chatId,
-                    "🖼 <i>Альбом предпросмотра отправлен выше 👆</i>\nВыберите следующее действие:",
-                    parseMode: ParseMode.Html,
-                    replyMarkup: albumNavKeyboard,
-                    cancellationToken: ct
-                );
             }
         }
         finally
