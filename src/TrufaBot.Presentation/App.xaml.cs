@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using TrufaBot.Application.Interfaces;
 using TrufaBot.Application.Services;
 using TrufaBot.Infrastructure.Logging;
+using TrufaBot.Infrastructure.Services;
 using TrufaBot.Infrastructure.Storage;
 using TrufaBot.Infrastructure.Telegram;
 using TrufaBot.Presentation.ViewModels;
@@ -24,6 +25,8 @@ public partial class App : System.Windows.Application
                 services.AddSingleton<IThumbnailService, ThumbnailService>();
                 services.AddSingleton<IAuthorizationService, AuthorizationService>();
                 services.AddSingleton<IStorageSyncService, StorageSyncService>();
+                services.AddSingleton<IAiVisionService, AiVisionService>();
+                services.AddSingleton<AiIndexingService>();
                 services.AddSingleton<TelegramBotService>();
 
                 services.AddSingleton<MainViewModel>();

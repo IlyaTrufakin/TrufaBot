@@ -27,5 +27,10 @@ public class MediaItem
     public ClassificationStatus ClassificationStatus { get; set; } = ClassificationStatus.Pending;
     public DateTime LastIndexedAt { get; set; } = DateTime.UtcNow;
 
+    // --- Поля Локального ИИ (LM Studio / Vision VLM) ---
+    public string? AIDescription { get; set; }
+    public string? AITags { get; set; }
+    public DateTime? AIProcessedAt { get; set; }
+
     public ICollection<MediaClassification> Classifications { get; set; } = new List<MediaClassification>();
 }

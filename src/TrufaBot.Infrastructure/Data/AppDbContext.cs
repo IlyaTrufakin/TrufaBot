@@ -43,4 +43,49 @@ public class AppDbContext : DbContext
         modelBuilder.Entity<AuditLogEntry>()
             .HasIndex(a => a.Timestamp);
     }
+
+    public static void EnsureSchemaUpdated()
+    {
+        using var db = new AppDbContext();
+        db.Database.EnsureCreated();
+
+        try
+        {
+            using var cmd = db.Database.GetDbConnection().CreateCommand();
+            cmd.CommandText = "PRAGMA table_info(MediaItems);";
+            db.Database.OpenConnection();
+            var existingCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    existingCols.Add(reader.GetString(1));
+                }
+            }
+
+            if (!existingCols.Contains("AIDescription"))
+            {
+                using var alterCmd = db.Database.GetDbConnection().CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AIDescription TEXT NULL;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!existingCols.Contains("AITags"))
+            {
+                using var alterCmd = db.Database.GetDbConnection().CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AITags TEXT NULL;";
+                alterCmd.ExecuteNonQuery();
+            }
+
+            if (!existingCols.Contains("AIProcessedAt"))
+            {
+                using var alterCmd = db.Database.GetDbConnection().CreateCommand();
+                alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AIProcessedAt TEXT NULL;";
+                alterCmd.ExecuteNonQuery();
+            }
+        }
+        catch
+        {
+        }
+    }
 }
