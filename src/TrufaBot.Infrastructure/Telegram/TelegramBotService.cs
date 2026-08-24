@@ -1,5 +1,4 @@
-﻿using TrufaBot.Application.Services;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -8,6 +7,7 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using TrufaBot.Application.Interfaces;
+using TrufaBot.Application.Services;
 using TrufaBot.Domain.Entities;
 using TrufaBot.Infrastructure.Data;
 using TrufaBot.Infrastructure.Storage;
@@ -86,7 +86,7 @@ public class TelegramBotService
         {
             new BotCommand { Command = "start", Description = "🏠 Главное меню" },
             new BotCommand { Command = "browse", Description = "📁 Проводник папок" },
-            new BotCommand { Command = "people", Description = "👥 Члены семьи (по лицам)" },
+            new BotCommand { Command = "people", Description = "👥 Люди (Семья и Друзья)" },
             new BotCommand { Command = "search", Description = "🔍 Умный поиск по фото" },
             new BotCommand { Command = "random", Description = "🎲 Случайное фото" }
         }, cancellationToken: _cts.Token);
@@ -105,7 +105,7 @@ public class TelegramBotService
     {
         return new ReplyKeyboardMarkup(new[]
         {
-            new KeyboardButton[] { "📁 Проводник архива", "👥 Члены семьи" },
+            new KeyboardButton[] { "📁 Проводник архива", "👥 Люди (Семья / Друзья)" },
             new KeyboardButton[] { "🎲 Случайное фото" }
         })
         {
@@ -187,7 +187,7 @@ public class TelegramBotService
         {
             await SendSourcesMenuAsync(bot, message.Chat.Id, null, user, db, ct);
         }
-        else if (text.Equals("👥 Члены семьи", StringComparison.OrdinalIgnoreCase) || text.Equals("/people", StringComparison.OrdinalIgnoreCase))
+        else if (text.Equals("👥 Люди (Семья / Друзья)", StringComparison.OrdinalIgnoreCase) || text.Equals("👥 Члены семьи", StringComparison.OrdinalIgnoreCase) || text.Equals("/people", StringComparison.OrdinalIgnoreCase))
         {
             await SendPeopleMenuAsync(bot, message.Chat.Id, null, user, db, ct);
         }
@@ -196,7 +196,7 @@ public class TelegramBotService
             var query = text.Contains(' ') ? text.Substring(text.IndexOf(' ') + 1).Trim() : "";
             if (string.IsNullOrEmpty(query))
             {
-                await bot.SendMessage(message.Chat.Id, "🔍 <b>Как искать по архиву:</b>\nНапишите запрос после команды, например:\n<code>/search Илья на лыжах</code>\n<code>/search море закат</code>", parseMode: ParseMode.Html, cancellationToken: ct);
+                await bot.SendMessage(message.Chat.Id, "🔍 <b>Как искать по архиву:</b>\nНапишите запрос после команды, например:\n<code>/search Илья на лыжах</code>\n<code>/search друзья на море</code>", parseMode: ParseMode.Html, cancellationToken: ct);
             }
             else
             {
@@ -218,24 +218,65 @@ public class TelegramBotService
     {
         var people = await db.People
             .Include(p => p.Faces)
-            .OrderBy(p => p.Name)
+            .OrderBy(p => p.Category)
+            .ThenBy(p => p.Name)
             .ToListAsync(ct);
 
         var buttons = new List<InlineKeyboardButton[]>();
-        foreach (var person in people)
+
+        // 1. Семья
+        var family = people.Where(p => string.Equals(p.Category, "Семья", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (family.Any())
         {
-            int faceCount = person.Faces.Count;
-            buttons.Add(new[]
+            for (int i = 0; i < family.Count; i += 2)
             {
-                InlineKeyboardButton.WithCallbackData($"👤 {person.Name} ({faceCount} фото)", $"view_person_{person.Id}")
-            });
+                var row = new List<InlineKeyboardButton>();
+                row.Add(InlineKeyboardButton.WithCallbackData($"👨‍👩‍👧 {family[i].Name} ({family[i].Faces.Count})", $"view_person_{family[i].Id}"));
+                if (i + 1 < family.Count)
+                {
+                    row.Add(InlineKeyboardButton.WithCallbackData($"👨‍👩‍👧 {family[i + 1].Name} ({family[i + 1].Faces.Count})", $"view_person_{family[i + 1].Id}"));
+                }
+                buttons.Add(row.ToArray());
+            }
+        }
+
+        // 2. Друзья
+        var friends = people.Where(p => string.Equals(p.Category, "Друзья", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (friends.Any())
+        {
+            for (int i = 0; i < friends.Count; i += 2)
+            {
+                var row = new List<InlineKeyboardButton>();
+                row.Add(InlineKeyboardButton.WithCallbackData($"🎉 {friends[i].Name} ({friends[i].Faces.Count})", $"view_person_{friends[i].Id}"));
+                if (i + 1 < friends.Count)
+                {
+                    row.Add(InlineKeyboardButton.WithCallbackData($"🎉 {friends[i + 1].Name} ({friends[i + 1].Faces.Count})", $"view_person_{friends[i + 1].Id}"));
+                }
+                buttons.Add(row.ToArray());
+            }
+        }
+
+        // 3. Другие / Коллеги
+        var others = people.Where(p => !string.Equals(p.Category, "Семья", StringComparison.OrdinalIgnoreCase) && !string.Equals(p.Category, "Друзья", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (others.Any())
+        {
+            for (int i = 0; i < others.Count; i += 2)
+            {
+                var row = new List<InlineKeyboardButton>();
+                row.Add(InlineKeyboardButton.WithCallbackData($"👤 {others[i].Name} ({others[i].Faces.Count})", $"view_person_{others[i].Id}"));
+                if (i + 1 < others.Count)
+                {
+                    row.Add(InlineKeyboardButton.WithCallbackData($"👤 {others[i + 1].Name} ({others[i + 1].Faces.Count})", $"view_person_{others[i + 1].Id}"));
+                }
+                buttons.Add(row.ToArray());
+            }
         }
 
         buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu") });
 
-        string messageText = buttons.Count > 1
-            ? "👥 <b>Выберите члена семьи для просмотра фотоальбома:</b>"
-            : "В базе пока нет добавленных членов семьи.\nДобавьте их в приложении на ПК во вкладке «Члены семьи».";
+        string messageText = people.Any()
+            ? "👥 <b>Выберите человека для просмотра фотоальбома:</b>\n<i>(Разделено по категориям: Семья, Друзья, Коллеги)</i>"
+            : "В базе пока нет добавленных людей.\nДобавьте их в приложении на ПК во вкладке «Люди (Семья, Друзья)».";
 
         if (editMessageId.HasValue)
         {
@@ -264,7 +305,7 @@ public class TelegramBotService
 
         if (!terms.Any())
         {
-            await bot.SendMessage(chatId, "Введите хотя бы одно слово для поиска (например: <i>Илья, море, горы</i>).", parseMode: ParseMode.Html, cancellationToken: ct);
+            await bot.SendMessage(chatId, "Введите хотя бы одно слово для поиска (например: <i>Илья, друзья, море</i>).", parseMode: ParseMode.Html, cancellationToken: ct);
             return;
         }
 
@@ -285,14 +326,15 @@ public class TelegramBotService
                 var tags = (m.AITags ?? "").ToLowerInvariant();
                 var name = m.FileName.ToLowerInvariant();
                 var path = m.RelativePath.ToLowerInvariant();
-                var personNames = m.Faces
+                var people = m.Faces
                     .Where(f => f.Person != null)
-                    .Select(f => f.Person!.Name.ToLowerInvariant())
+                    .Select(f => f.Person!)
                     .ToList();
 
                 foreach (var term in terms)
                 {
-                    if (personNames.Any(p => p.Contains(term))) score += 10; // Высший приоритет за совпадение лица!
+                    if (people.Any(p => p.Name.ToLowerInvariant().Contains(term))) score += 10; // Имя человека
+                    if (people.Any(p => p.Category.ToLowerInvariant().Contains(term))) score += 8; // Категория (семья / друзья)
                     if (tags.Contains(term)) score += 5;
                     if (desc.Contains(term)) score += 3;
                     if (name.Contains(term)) score += 2;
@@ -312,7 +354,7 @@ public class TelegramBotService
             await bot.SendMessage(
                 chatId,
                 $"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n" +
-                $"💡 <i>Совет: Попробуйте поискать по имени человека (Илья, Анна) или по сюжету (море, горы, праздник, авто).</i>",
+                $"💡 <i>Совет: Попробуйте поискать по имени человека (Илья, Анна), группе (семья, друзья) или по сюжету (море, горы, праздник, авто).</i>",
                 parseMode: ParseMode.Html,
                 replyMarkup: GetPersistentMenuKeyboard(),
                 cancellationToken: ct
@@ -340,15 +382,15 @@ public class TelegramBotService
         var inlineKeyboard = new InlineKeyboardMarkup(new[]
         {
             new[] { InlineKeyboardButton.WithCallbackData("📁 Проводник архива", "nav_sources") },
-            new[] { InlineKeyboardButton.WithCallbackData("👥 Члены семьи", "nav_people") },
+            new[] { InlineKeyboardButton.WithCallbackData("👥 Люди (Семья и Друзья)", "nav_people") },
             new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") }
         });
 
         await bot.SendMessage(
             chatId,
             $"👋 Здравствуйте, <b>{user.DisplayName}</b>!\n\n" +
-            $"Добро пожаловать в семейный архив медиафайлов.\n" +
-            $"💡 <i>Вы можете написать мне имя члена семьи (например: «Илья») или тему («закат на море»), и я найду нужные кадры с помощью встроенного ИИ и распознавания лиц!</i>",
+            $"Добро пожаловать в архив медиафайлов.\n" +
+            $"💡 <i>Вы можете написать имя человека («Илья»), категорию («друзья на море») или сюжет («закат в горах»), и я найду нужные фото!</i>",
             parseMode: ParseMode.Html,
             replyMarkup: inlineKeyboard,
             cancellationToken: ct
@@ -437,7 +479,7 @@ public class TelegramBotService
                         FilePage = 0,
                         CachedFiles = itemsWithPerson,
                         IsSearchMode = true,
-                        SearchQuery = $"Фотографии: {person.Name}"
+                        SearchQuery = $"{person.Name} ({person.Category})"
                     };
 
                     _userSessions[userId] = state;
@@ -867,7 +909,7 @@ public class TelegramBotService
             navButtons.Add(new[]
             {
                 InlineKeyboardButton.WithCallbackData("📁 К папкам архива", "nav_sources"),
-                InlineKeyboardButton.WithCallbackData("👥 Члены семьи", "nav_people")
+                InlineKeyboardButton.WithCallbackData("👥 Люди (Семья/Друзья)", "nav_people")
             });
         }
         else

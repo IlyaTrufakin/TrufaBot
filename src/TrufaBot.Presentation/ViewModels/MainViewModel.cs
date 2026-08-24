@@ -134,6 +134,12 @@ public partial class MainViewModel : ObservableObject
     private string _newPersonName = "";
 
     [ObservableProperty]
+    private string _selectedPersonCategory = "Семья";
+
+    [ObservableProperty]
+    private ObservableCollection<string> _availablePersonCategories = new() { "Семья", "Друзья", "Коллеги", "Знакомые" };
+
+    [ObservableProperty]
     private string _newPersonNotes = "";
 
     [ObservableProperty]
@@ -306,7 +312,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         People.Clear();
-        foreach (var p in db.People.Include(p => p.Faces).ToList())
+        foreach (var p in db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToList())
         {
             People.Add(p);
         }
@@ -365,7 +371,7 @@ public partial class MainViewModel : ObservableObject
             {
                 using var db = new AppDbContext();
                 var totalFaces = await db.PersonFaces.CountAsync();
-                var peopleList = await db.People.Include(p => p.Faces).ToListAsync();
+                var peopleList = await db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
 
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
@@ -386,7 +392,7 @@ public partial class MainViewModel : ObservableObject
     {
         if (string.IsNullOrWhiteSpace(NewPersonName))
         {
-            System.Windows.MessageBox.Show("Введите имя члена семьи!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
+            System.Windows.MessageBox.Show("Введите имя человека!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -394,6 +400,7 @@ public partial class MainViewModel : ObservableObject
         var person = new Person
         {
             Name = NewPersonName.Trim(),
+            Category = string.IsNullOrWhiteSpace(SelectedPersonCategory) ? "Семья" : SelectedPersonCategory.Trim(),
             Notes = NewPersonNotes.Trim(),
             CreatedAt = DateTime.UtcNow
         };
@@ -401,7 +408,7 @@ public partial class MainViewModel : ObservableObject
         db.People.Add(person);
         await db.SaveChangesAsync();
 
-        _auditLogger.Log("Info", "Faces", $"Добавлен член семьи: {person.Name}");
+        _auditLogger.Log("Info", "Faces", $"Добавлен профиль: {person.Name} ({person.Category})");
 
         NewPersonName = "";
         NewPersonNotes = "";
@@ -413,7 +420,7 @@ public partial class MainViewModel : ObservableObject
     {
         if (person == null) return;
 
-        if (System.Windows.MessageBox.Show($"Удалить профиль '{person.Name}'?", "Подтверждение", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+        if (System.Windows.MessageBox.Show($"Удалить профиль '{person.Name}' ({person.Category})?", "Подтверждение", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
         {
             using var db = new AppDbContext();
             var p = await db.People.Include(p => p.Faces).FirstOrDefaultAsync(x => x.Id == person.Id);

@@ -62,42 +62,43 @@ public class AppDbContext : DbContext
             using var cmd = db.Database.GetDbConnection().CreateCommand();
             cmd.CommandText = "PRAGMA table_info(MediaItems);";
             db.Database.OpenConnection();
-            var existingCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var existingMediaCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             using (var reader = cmd.ExecuteReader())
             {
                 while (reader.Read())
                 {
-                    existingCols.Add(reader.GetString(1));
+                    existingMediaCols.Add(reader.GetString(1));
                 }
             }
 
-            if (!existingCols.Contains("AIDescription"))
+            if (!existingMediaCols.Contains("AIDescription"))
             {
                 using var alterCmd = db.Database.GetDbConnection().CreateCommand();
                 alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AIDescription TEXT NULL;";
                 alterCmd.ExecuteNonQuery();
             }
 
-            if (!existingCols.Contains("AITags"))
+            if (!existingMediaCols.Contains("AITags"))
             {
                 using var alterCmd = db.Database.GetDbConnection().CreateCommand();
                 alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AITags TEXT NULL;";
                 alterCmd.ExecuteNonQuery();
             }
 
-            if (!existingCols.Contains("AIProcessedAt"))
+            if (!existingMediaCols.Contains("AIProcessedAt"))
             {
                 using var alterCmd = db.Database.GetDbConnection().CreateCommand();
                 alterCmd.CommandText = "ALTER TABLE MediaItems ADD COLUMN AIProcessedAt TEXT NULL;";
                 alterCmd.ExecuteNonQuery();
             }
 
-            // Создаем таблицы People и PersonFaces если они еще не существуют
+            // Проверяем таблицы People и PersonFaces
             using var tablesCmd = db.Database.GetDbConnection().CreateCommand();
             tablesCmd.CommandText = @"
                 CREATE TABLE IF NOT EXISTS People (
                     Id INTEGER PRIMARY KEY AUTOINCREMENT,
                     Name TEXT NOT NULL,
+                    Category TEXT NOT NULL DEFAULT 'Семья',
                     Notes TEXT NULL,
                     CreatedAt TEXT NOT NULL
                 );
@@ -118,6 +119,25 @@ public class AppDbContext : DbContext
                 CREATE INDEX IF NOT EXISTS IX_PersonFaces_MediaItemId ON PersonFaces(MediaItemId);
             ";
             tablesCmd.ExecuteNonQuery();
+
+            // Проверяем наличие колонки Category в People (если таблица уже была создана)
+            using var personColsCmd = db.Database.GetDbConnection().CreateCommand();
+            personColsCmd.CommandText = "PRAGMA table_info(People);";
+            var existingPeopleCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var reader = personColsCmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    existingPeopleCols.Add(reader.GetString(1));
+                }
+            }
+
+            if (!existingPeopleCols.Contains("Category"))
+            {
+                using var alterPeopleCmd = db.Database.GetDbConnection().CreateCommand();
+                alterPeopleCmd.CommandText = "ALTER TABLE People ADD COLUMN Category TEXT NOT NULL DEFAULT 'Семья';";
+                alterPeopleCmd.ExecuteNonQuery();
+            }
         }
         catch
         {
