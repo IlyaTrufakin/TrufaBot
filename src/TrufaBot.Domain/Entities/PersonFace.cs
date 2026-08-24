@@ -3,6 +3,7 @@
 public class PersonFace
 {
     public long Id { get; set; }
+
     public int? PersonId { get; set; }
     public Person? Person { get; set; }
 
@@ -14,7 +15,10 @@ public class PersonFace
     public float BoxWidth { get; set; }
     public float BoxHeight { get; set; }
 
-    public string? Embedding { get; set; } // Base64 representation of float[] vector
+    public string? Embedding { get; set; }
     public float Confidence { get; set; }
+
+    public bool IsIgnored { get; set; } = false;
+
     public DateTime DetectedAt { get; set; } = DateTime.UtcNow;
 }

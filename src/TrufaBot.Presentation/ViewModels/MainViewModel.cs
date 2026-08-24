@@ -425,7 +425,7 @@ public partial class MainViewModel : ObservableObject
             var unassigned = await db.PersonFaces
                 .Include(f => f.MediaItem)
                 .ThenInclude(m => m.StorageSource)
-                .Where(f => f.PersonId == null && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                .Where(f => f.PersonId == null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
                 .OrderByDescending(f => f.Id)
                 .Take(12)
                 .ToListAsync();
@@ -458,7 +458,10 @@ public partial class MainViewModel : ObservableObject
                 }
             });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка загрузки лиц: {ex.Message}");
+        }
     }
 
     private void LoadPhotosForSelectedPerson(Person? person)
@@ -518,19 +521,34 @@ public partial class MainViewModel : ObservableObject
     private async Task IgnoreFaceAsync(UnassignedFaceItemViewModel? item)
     {
         if (item == null) return;
-        await _faceService.IgnoreFaceAsync(item.FaceId);
-        _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто).");
-        await LoadUnassignedFacesAsync();
+        try
+        {
+            await _faceService.IgnoreFaceAsync(item.FaceId);
+            _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто).");
+            await LoadUnassignedFacesAsync();
+            RefreshFaceStats();
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка при скрытии лица: {ex.Message}");
+        }
     }
 
     [RelayCommand]
     private async Task DeleteFalseFaceAsync(UnassignedFaceItemViewModel? item)
     {
         if (item == null) return;
-        await _faceService.DeleteFaceAsync(item.FaceId);
-        _auditLogger.Log("Info", "Faces", $"Удалено ошибочное распознавание лица на '{item.FileName}'.");
-        await LoadUnassignedFacesAsync();
-        RefreshFaceStats();
+        try
+        {
+            await _faceService.DeleteFaceAsync(item.FaceId);
+            _auditLogger.Log("Info", "Faces", $"Удалено ошибочное распознавание лица на '{item.FileName}'.");
+            await LoadUnassignedFacesAsync();
+            RefreshFaceStats();
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка удаления детекции лица: {ex.Message}");
+        }
     }
 
     [RelayCommand]

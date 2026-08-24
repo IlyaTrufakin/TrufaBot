@@ -113,6 +113,7 @@ public class AppDbContext : DbContext
                     BoxHeight REAL NOT NULL,
                     Embedding TEXT NULL,
                     Confidence REAL NOT NULL,
+                    IsIgnored INTEGER NOT NULL DEFAULT 0,
                     DetectedAt TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS IX_PersonFaces_PersonId ON PersonFaces(PersonId);
@@ -120,7 +121,7 @@ public class AppDbContext : DbContext
             ";
             tablesCmd.ExecuteNonQuery();
 
-            // Проверяем наличие колонки Category в People (если таблица уже была создана)
+            // Проверяем наличие колонки Category в People
             using var personColsCmd = db.Database.GetDbConnection().CreateCommand();
             personColsCmd.CommandText = "PRAGMA table_info(People);";
             var existingPeopleCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -138,6 +139,30 @@ public class AppDbContext : DbContext
                 alterPeopleCmd.CommandText = "ALTER TABLE People ADD COLUMN Category TEXT NOT NULL DEFAULT 'Семья';";
                 alterPeopleCmd.ExecuteNonQuery();
             }
+
+            // Проверяем наличие колонки IsIgnored в PersonFaces
+            using var faceColsCmd = db.Database.GetDbConnection().CreateCommand();
+            faceColsCmd.CommandText = "PRAGMA table_info(PersonFaces);";
+            var existingFaceCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var reader = faceColsCmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    existingFaceCols.Add(reader.GetString(1));
+                }
+            }
+
+            if (!existingFaceCols.Contains("IsIgnored"))
+            {
+                using var alterFaceCmd = db.Database.GetDbConnection().CreateCommand();
+                alterFaceCmd.CommandText = "ALTER TABLE PersonFaces ADD COLUMN IsIgnored INTEGER NOT NULL DEFAULT 0;";
+                alterFaceCmd.ExecuteNonQuery();
+            }
+
+            // Очищаем любые недопустимые PersonId <= 0 если они были записаны
+            using var cleanupCmd = db.Database.GetDbConnection().CreateCommand();
+            cleanupCmd.CommandText = "UPDATE PersonFaces SET IsIgnored = 1, PersonId = NULL WHERE PersonId <= 0;";
+            cleanupCmd.ExecuteNonQuery();
         }
         catch
         {

@@ -37,7 +37,7 @@ public class FaceRecognitionService : IFaceRecognitionService
             using var db = new AppDbContext();
             var knownFaces = await db.PersonFaces
                 .Include(f => f.Person)
-                .Where(f => f.PersonId != null && f.PersonId > 0 && !string.IsNullOrEmpty(f.Embedding))
+                .Where(f => f.PersonId != null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
                 .ToListAsync(ct);
 
             foreach (var face in detectedFaces)
@@ -55,7 +55,7 @@ public class FaceRecognitionService : IFaceRecognitionService
                     if (sim > bestSimilarity)
                     {
                         bestSimilarity = sim;
-                        if (sim >= 0.72f) // Строгий порог распознавания
+                        if (sim >= 0.72f)
                         {
                             bestPersonId = known.PersonId;
                             bestPersonName = known.Person?.Name;
@@ -134,6 +134,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         if (targetFace != null)
         {
             targetFace.PersonId = personId;
+            targetFace.IsIgnored = false;
             await db.SaveChangesAsync(ct);
         }
     }
@@ -144,8 +145,8 @@ public class FaceRecognitionService : IFaceRecognitionService
         var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
         if (targetFace != null)
         {
-            // -1 означает "Незнакомец / Другой человек (скрыть из списка)"
-            targetFace.PersonId = -1;
+            targetFace.IsIgnored = true;
+            targetFace.PersonId = null;
             await db.SaveChangesAsync(ct);
         }
     }
@@ -170,7 +171,7 @@ public class FaceRecognitionService : IFaceRecognitionService
     public async Task ResetAllAssignmentsAsync(CancellationToken ct = default)
     {
         using var db = new AppDbContext();
-        await db.Database.ExecuteSqlRawAsync("UPDATE PersonFaces SET PersonId = NULL WHERE PersonId != -1;", ct);
+        await db.Database.ExecuteSqlRawAsync("UPDATE PersonFaces SET PersonId = NULL;", ct);
     }
 
     public async Task ClearAllFacesAndResetAsync(CancellationToken ct = default)
@@ -232,16 +233,12 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
     }
 
-    /// <summary>
-    /// Строгий детектор лиц человека: фильтрует растения, текстуры, фоны по спектру оттенков кожи (Skin-Tone YCbCr/HSV) и структуре лица (глаза/нос/рот)
-    /// </summary>
     private List<DetectedFaceResult> FindRealHumanFaces(SKBitmap original)
     {
         var list = new List<DetectedFaceResult>();
         int w = original.Width;
         int h = original.Height;
 
-        // Кандидатные зоны (портретный центр, групповое левое, групповое правое, верхний план)
         var candidateZones = new[]
         {
             new { X = 0.20f, Y = 0.10f, W = 0.60f, H = 0.65f },
@@ -263,14 +260,9 @@ public class FaceRecognitionService : IFaceRecognitionService
             using var cropBitmap = new SKBitmap();
             if (!original.ExtractSubset(cropBitmap, subset)) continue;
 
-            // 1. Проверка на процент оттенков человеческой кожи (Skin-Tone Test)
-            // Исключает зелень, растения, небо, мебель, стены
             if (!ValidateHumanSkinTone(cropBitmap, out float skinRatio)) continue;
-
-            // 2. Проверка анатомической структуры лица (глазная зона темнее, центр носа светлее)
             if (!ValidateFacialLuminanceStructure(cropBitmap)) continue;
 
-            // 3. Вычисление вектора признаков
             var embedding = ComputeNormalizedFeatureVector(cropBitmap, EmbeddingSize);
 
             list.Add(new DetectedFaceResult
@@ -283,7 +275,6 @@ public class FaceRecognitionService : IFaceRecognitionService
                 Embedding = embedding
             });
 
-            // Для одиночных портретов достаточно одного четкого лица
             if (skinRatio > 0.65f) break;
         }
 
@@ -295,7 +286,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         skinRatio = 0f;
         int totalPixels = 0;
         int skinPixels = 0;
-        int greenPixels = 0; // Для отсечения растений
+        int greenPixels = 0;
 
         using var small = bitmap.Resize(new SKImageInfo(64, 64, SKColorType.Rgba8888), SKFilterQuality.Low);
         if (small == null) return false;
@@ -308,19 +299,15 @@ public class FaceRecognitionService : IFaceRecognitionService
             byte b = p.Blue;
             totalPixels++;
 
-            // Отсекаем растения: зеленый доминирует над красным
             if (g > r && g > b)
             {
                 greenPixels++;
             }
 
-            // Классическая модель оттенка кожи человека в RGB
-            // R > G > B, достаточная разница и естественные границы
             if (r > 95 && g > 40 && b > 20 &&
                 (Math.Max(r, Math.Max(g, b)) - Math.Min(r, Math.Min(g, b))) > 15 &&
                 Math.Abs(r - g) > 15 && r > g && r > b)
             {
-                // Проверка в YCbCr: Cb в [77, 127], Cr в [133, 173]
                 double cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
                 double cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
 
@@ -332,13 +319,9 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
 
         if (totalPixels == 0) return false;
-
-        // Если в кадре много зелени (растения/листья) — это точно не лицо
         if ((float)greenPixels / totalPixels > 0.20f) return false;
 
         skinRatio = (float)skinPixels / totalPixels;
-
-        // Человеческое лицо в фокусе должно содержать от 25% до 85% тона кожи
         return skinRatio >= 0.25f && skinRatio <= 0.85f;
     }
 
@@ -350,18 +333,14 @@ public class FaceRecognitionService : IFaceRecognitionService
         var bytes = small.GetPixelSpan();
         if (bytes.Length < 1024) return false;
 
-        // Верхняя треть (глаза/брови)
         float topLuma = 0;
         for (int i = 0; i < 32 * 10; i++) topLuma += bytes[i];
         topLuma /= (32 * 10);
 
-        // Средняя треть (нос/щеки)
         float midLuma = 0;
         for (int i = 32 * 10; i < 32 * 22; i++) midLuma += bytes[i];
         midLuma /= (32 * 12);
 
-        // У лица средняя часть (нос, лоб, щеки) обычно ярче зоны глаз/волос
-        // Плоские стены, асфальт или случайные текстуры этого градиента не имеют
         return Math.Abs(midLuma - topLuma) > 4;
     }
 
