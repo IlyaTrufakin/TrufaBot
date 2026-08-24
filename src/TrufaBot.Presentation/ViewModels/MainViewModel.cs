@@ -424,10 +424,58 @@ public partial class MainViewModel : ObservableObject
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     TotalKnownFacesCount = totalFaces;
-                    People.Clear();
-                    foreach (var p in peopleList)
+                    var currentSelectedId = SelectedPerson?.Id;
+
+                    // Обновляем список людей без полного Clear, чтобы не сбрасывать выбранного человека
+                    var dict = peopleList.ToDictionary(p => p.Id);
+
+                    for (int i = People.Count - 1; i >= 0; i--)
                     {
-                        People.Add(p);
+                        if (!dict.ContainsKey(People[i].Id))
+                        {
+                            People.RemoveAt(i);
+                        }
+                    }
+
+                    for (int i = 0; i < peopleList.Count; i++)
+                    {
+                        var fresh = peopleList[i];
+                        if (i < People.Count && People[i].Id == fresh.Id)
+                        {
+                            People[i].Name = fresh.Name;
+                            People[i].Category = fresh.Category;
+                            People[i].Notes = fresh.Notes;
+                            People[i].Faces = fresh.Faces;
+                        }
+                        else
+                        {
+                            var existing = People.FirstOrDefault(x => x.Id == fresh.Id);
+                            if (existing != null)
+                            {
+                                existing.Name = fresh.Name;
+                                existing.Category = fresh.Category;
+                                existing.Notes = fresh.Notes;
+                                existing.Faces = fresh.Faces;
+                            }
+                            else
+                            {
+                                People.Insert(i, fresh);
+                            }
+                        }
+                    }
+
+                    // Сохраняем и восстанавливаем выбор
+                    if (currentSelectedId.HasValue)
+                    {
+                        var matched = People.FirstOrDefault(x => x.Id == currentSelectedId.Value);
+                        if (matched != null && (SelectedPerson == null || SelectedPerson.Id != matched.Id))
+                        {
+                            SelectedPerson = matched;
+                        }
+                    }
+                    else if (People.Any() && SelectedPerson == null)
+                    {
+                        SelectedPerson = People.First();
                     }
                 });
             }
@@ -595,9 +643,12 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
+            var personId = SelectedPerson.Id;
+            var personName = SelectedPerson.Name;
+
             using var db = new AppDbContext();
             var faces = await db.PersonFaces
-                .Where(f => f.MediaItemId == photoItem.MediaItemId && f.PersonId == SelectedPerson.Id)
+                .Where(f => f.MediaItemId == photoItem.MediaItemId && f.PersonId == personId)
                 .ToListAsync();
 
             foreach (var f in faces)
@@ -606,9 +657,12 @@ public partial class MainViewModel : ObservableObject
             }
             await db.SaveChangesAsync();
 
-            _auditLogger.Log("Info", "Faces", $"Фото '{photoItem.FileName}' успешно отвязано от '{SelectedPerson.Name}'.");
-            
+            _auditLogger.Log("Info", "Faces", $"Фото '{photoItem.FileName}' успешно отвязано от '{personName}'.");
+
+            // Удаляем только эту карточку из видимой галереи мгновенно
             SelectedPersonPhotos.Remove(photoItem);
+
+            // Обновляем счетчики в фоне без сброса выбора человека
             RefreshFaceStats();
             await LoadUnassignedFacesAsync();
         }
