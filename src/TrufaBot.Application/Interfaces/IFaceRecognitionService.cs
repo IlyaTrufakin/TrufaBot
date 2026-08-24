@@ -18,9 +18,10 @@ public class DetectedFaceResult
 public interface IFaceRecognitionService
 {
     Task<List<DetectedFaceResult>> DetectAndRecognizeFacesAsync(string imagePath, CancellationToken ct = default);
-    Task<int?> MatchFaceEmbeddingAsync(float[] embedding, float threshold = 0.60f, CancellationToken ct = default);
-    double CalculateCosineSimilarity(float[] emb1, float[] emb2);
     Task<string> GetOrCreateFaceCropThumbnailAsync(string originalImagePath, float boxX, float boxY, float boxW, float boxH, long faceId, CancellationToken ct = default);
-    Task<int> AssignFaceAndPropagateAsync(long faceId, int personId, float threshold = 0.60f, CancellationToken ct = default);
-    Task<int> AutoMatchAllUnassignedFacesAsync(float threshold = 0.60f, CancellationToken ct = default);
+    Task AssignFaceToPersonAsync(long faceId, int personId, CancellationToken ct = default);
+    Task IgnoreFaceAsync(long faceId, CancellationToken ct = default);
+    Task DeleteFaceAsync(long faceId, CancellationToken ct = default);
+    Task ResetAllAssignmentsAsync(CancellationToken ct = default);
+    Task ClearAllFacesAndResetAsync(CancellationToken ct = default);
 }

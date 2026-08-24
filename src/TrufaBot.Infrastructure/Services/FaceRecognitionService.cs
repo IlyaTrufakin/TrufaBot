@@ -1,5 +1,4 @@
-﻿using System.Security.Cryptography;
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using SkiaSharp;
 using TrufaBot.Application.Interfaces;
 using TrufaBot.Domain.Entities;
@@ -30,14 +29,15 @@ public class FaceRecognitionService : IFaceRecognitionService
             if (codec == null) return results;
 
             using var bitmap = SKBitmap.Decode(codec);
-            if (bitmap == null || bitmap.Width < 50 || bitmap.Height < 50) return results;
+            if (bitmap == null || bitmap.Width < 80 || bitmap.Height < 80) return results;
 
-            var detectedFaces = ExtractFaceCrops(bitmap);
+            var detectedFaces = FindRealHumanFaces(bitmap);
+            if (!detectedFaces.Any()) return results;
 
             using var db = new AppDbContext();
             var knownFaces = await db.PersonFaces
                 .Include(f => f.Person)
-                .Where(f => f.PersonId != null && !string.IsNullOrEmpty(f.Embedding))
+                .Where(f => f.PersonId != null && f.PersonId > 0 && !string.IsNullOrEmpty(f.Embedding))
                 .ToListAsync(ct);
 
             foreach (var face in detectedFaces)
@@ -48,15 +48,14 @@ public class FaceRecognitionService : IFaceRecognitionService
 
                 foreach (var known in knownFaces)
                 {
-                    if (string.IsNullOrEmpty(known.Embedding)) continue;
-                    var knownVector = DecodeEmbedding(known.Embedding);
+                    var knownVector = DecodeEmbedding(known.Embedding!);
                     if (knownVector == null || knownVector.Length != face.Embedding.Length) continue;
 
                     var sim = (float)CalculateCosineSimilarity(face.Embedding, knownVector);
                     if (sim > bestSimilarity)
                     {
                         bestSimilarity = sim;
-                        if (sim >= 0.60f)
+                        if (sim >= 0.72f) // Строгий порог распознавания
                         {
                             bestPersonId = known.PersonId;
                             bestPersonName = known.Person?.Name;
@@ -77,35 +76,6 @@ public class FaceRecognitionService : IFaceRecognitionService
         return results;
     }
 
-    public async Task<int?> MatchFaceEmbeddingAsync(float[] embedding, float threshold = 0.60f, CancellationToken ct = default)
-    {
-        if (embedding == null || embedding.Length == 0) return null;
-
-        using var db = new AppDbContext();
-        var knownFaces = await db.PersonFaces
-            .Where(f => f.PersonId != null && !string.IsNullOrEmpty(f.Embedding))
-            .ToListAsync(ct);
-
-        int? bestPersonId = null;
-        double bestSimilarity = 0;
-
-        foreach (var face in knownFaces)
-        {
-            if (string.IsNullOrEmpty(face.Embedding)) continue;
-            var vector = DecodeEmbedding(face.Embedding);
-            if (vector == null || vector.Length != embedding.Length) continue;
-
-            var sim = CalculateCosineSimilarity(embedding, vector);
-            if (sim > bestSimilarity && sim >= threshold)
-            {
-                bestSimilarity = sim;
-                bestPersonId = face.PersonId;
-            }
-        }
-
-        return bestPersonId;
-    }
-
     public async Task<string> GetOrCreateFaceCropThumbnailAsync(string originalImagePath, float boxX, float boxY, float boxW, float boxH, long faceId, CancellationToken ct = default)
     {
         var cropPath = Path.Combine(FaceCacheDir, $"face_{faceId}.jpg");
@@ -123,7 +93,6 @@ public class FaceRecognitionService : IFaceRecognitionService
                 using var originalBitmap = SKBitmap.Decode(codec);
                 if (originalBitmap == null) return string.Empty;
 
-                // Добавляем 15% запас вокруг лица
                 int imgW = originalBitmap.Width;
                 int imgH = originalBitmap.Height;
 
@@ -158,98 +127,71 @@ public class FaceRecognitionService : IFaceRecognitionService
         }, ct);
     }
 
-    public async Task<int> AssignFaceAndPropagateAsync(long faceId, int personId, float threshold = 0.60f, CancellationToken ct = default)
+    public async Task AssignFaceToPersonAsync(long faceId, int personId, CancellationToken ct = default)
     {
         using var db = new AppDbContext();
         var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
-        if (targetFace == null) return 0;
-
-        targetFace.PersonId = personId;
-        int autoAssignedCount = 1;
-
-        if (!string.IsNullOrEmpty(targetFace.Embedding))
+        if (targetFace != null)
         {
-            var targetVector = DecodeEmbedding(targetFace.Embedding);
-            if (targetVector != null)
-            {
-                // Находим все неразмеченные лица и сравниваем с этим эталоном
-                var unassigned = await db.PersonFaces
-                    .Where(f => f.PersonId == null && !string.IsNullOrEmpty(f.Embedding) && f.Id != faceId)
-                    .ToListAsync(ct);
-
-                foreach (var face in unassigned)
-                {
-                    var vec = DecodeEmbedding(face.Embedding!);
-                    if (vec != null && vec.Length == targetVector.Length)
-                    {
-                        var sim = CalculateCosineSimilarity(targetVector, vec);
-                        if (sim >= threshold)
-                        {
-                            face.PersonId = personId;
-                            autoAssignedCount++;
-                        }
-                    }
-                }
-            }
+            targetFace.PersonId = personId;
+            await db.SaveChangesAsync(ct);
         }
-
-        await db.SaveChangesAsync(ct);
-        return autoAssignedCount;
     }
 
-    public async Task<int> AutoMatchAllUnassignedFacesAsync(float threshold = 0.60f, CancellationToken ct = default)
+    public async Task IgnoreFaceAsync(long faceId, CancellationToken ct = default)
     {
         using var db = new AppDbContext();
-
-        var knownFaces = await db.PersonFaces
-            .Where(f => f.PersonId != null && !string.IsNullOrEmpty(f.Embedding))
-            .ToListAsync(ct);
-
-        if (!knownFaces.Any()) return 0;
-
-        var unassignedFaces = await db.PersonFaces
-            .Where(f => f.PersonId == null && !string.IsNullOrEmpty(f.Embedding))
-            .ToListAsync(ct);
-
-        int matchedCount = 0;
-
-        foreach (var unassigned in unassignedFaces)
+        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
+        if (targetFace != null)
         {
-            var unassignedVec = DecodeEmbedding(unassigned.Embedding!);
-            if (unassignedVec == null) continue;
-
-            int? bestPersonId = null;
-            double bestSim = 0;
-
-            foreach (var known in knownFaces)
-            {
-                var knownVec = DecodeEmbedding(known.Embedding!);
-                if (knownVec == null || knownVec.Length != unassignedVec.Length) continue;
-
-                var sim = CalculateCosineSimilarity(unassignedVec, knownVec);
-                if (sim > bestSim && sim >= threshold)
-                {
-                    bestSim = sim;
-                    bestPersonId = known.PersonId;
-                }
-            }
-
-            if (bestPersonId.HasValue)
-            {
-                unassigned.PersonId = bestPersonId.Value;
-                matchedCount++;
-            }
+            // -1 означает "Незнакомец / Другой человек (скрыть из списка)"
+            targetFace.PersonId = -1;
+            await db.SaveChangesAsync(ct);
         }
+    }
 
-        if (matchedCount > 0)
+    public async Task DeleteFaceAsync(long faceId, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
+        if (targetFace != null)
         {
+            db.PersonFaces.Remove(targetFace);
             await db.SaveChangesAsync(ct);
         }
 
-        return matchedCount;
+        var cropPath = Path.Combine(FaceCacheDir, $"face_{faceId}.jpg");
+        if (File.Exists(cropPath))
+        {
+            try { File.Delete(cropPath); } catch { }
+        }
     }
 
-    public double CalculateCosineSimilarity(float[] emb1, float[] emb2)
+    public async Task ResetAllAssignmentsAsync(CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        await db.Database.ExecuteSqlRawAsync("UPDATE PersonFaces SET PersonId = NULL WHERE PersonId != -1;", ct);
+    }
+
+    public async Task ClearAllFacesAndResetAsync(CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM PersonFaces;", ct);
+
+        try
+        {
+            if (Directory.Exists(FaceCacheDir))
+            {
+                foreach (var file in Directory.GetFiles(FaceCacheDir))
+                {
+                    try { File.Delete(file); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
+    public static double CalculateCosineSimilarity(float[] emb1, float[] emb2)
     {
         if (emb1.Length != emb2.Length || emb1.Length == 0) return 0.0;
 
@@ -290,73 +232,152 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
     }
 
-    private List<DetectedFaceResult> ExtractFaceCrops(SKBitmap bitmap)
+    /// <summary>
+    /// Строгий детектор лиц человека: фильтрует растения, текстуры, фоны по спектру оттенков кожи (Skin-Tone YCbCr/HSV) и структуре лица (глаза/нос/рот)
+    /// </summary>
+    private List<DetectedFaceResult> FindRealHumanFaces(SKBitmap original)
     {
         var list = new List<DetectedFaceResult>();
-        int w = bitmap.Width;
-        int h = bitmap.Height;
+        int w = original.Width;
+        int h = original.Height;
 
-        var zones = new[]
+        // Кандидатные зоны (портретный центр, групповое левое, групповое правое, верхний план)
+        var candidateZones = new[]
         {
-            new { X = 0.25f, Y = 0.15f, W = 0.50f, H = 0.60f, Conf = 0.85f },
-            new { X = 0.10f, Y = 0.20f, W = 0.40f, H = 0.55f, Conf = 0.75f },
-            new { X = 0.50f, Y = 0.20f, W = 0.40f, H = 0.55f, Conf = 0.75f }
+            new { X = 0.20f, Y = 0.10f, W = 0.60f, H = 0.65f },
+            new { X = 0.08f, Y = 0.15f, W = 0.45f, H = 0.55f },
+            new { X = 0.47f, Y = 0.15f, W = 0.45f, H = 0.55f },
+            new { X = 0.28f, Y = 0.05f, W = 0.44f, H = 0.45f }
         };
 
-        foreach (var zone in zones)
+        foreach (var zone in candidateZones)
         {
             int cropX = (int)(zone.X * w);
             int cropY = (int)(zone.Y * h);
             int cropW = (int)(zone.W * w);
             int cropH = (int)(zone.H * h);
 
-            if (cropW < 40 || cropH < 40) continue;
+            if (cropW < 60 || cropH < 60) continue;
 
             var subset = new SKRectI(cropX, cropY, cropX + cropW, cropY + cropH);
-            using var faceBitmap = new SKBitmap();
-            if (bitmap.ExtractSubset(faceBitmap, subset))
+            using var cropBitmap = new SKBitmap();
+            if (!original.ExtractSubset(cropBitmap, subset)) continue;
+
+            // 1. Проверка на процент оттенков человеческой кожи (Skin-Tone Test)
+            // Исключает зелень, растения, небо, мебель, стены
+            if (!ValidateHumanSkinTone(cropBitmap, out float skinRatio)) continue;
+
+            // 2. Проверка анатомической структуры лица (глазная зона темнее, центр носа светлее)
+            if (!ValidateFacialLuminanceStructure(cropBitmap)) continue;
+
+            // 3. Вычисление вектора признаков
+            var embedding = ComputeNormalizedFeatureVector(cropBitmap, EmbeddingSize);
+
+            list.Add(new DetectedFaceResult
             {
-                var embedding = ComputeNormalizedFeatureVector(faceBitmap, EmbeddingSize);
-                list.Add(new DetectedFaceResult
-                {
-                    BoxX = zone.X,
-                    BoxY = zone.Y,
-                    BoxWidth = zone.W,
-                    BoxHeight = zone.H,
-                    Confidence = zone.Conf,
-                    Embedding = embedding
-                });
-            }
+                BoxX = zone.X,
+                BoxY = zone.Y,
+                BoxWidth = zone.W,
+                BoxHeight = zone.H,
+                Confidence = skinRatio,
+                Embedding = embedding
+            });
+
+            // Для одиночных портретов достаточно одного четкого лица
+            if (skinRatio > 0.65f) break;
         }
 
         return list;
     }
 
+    private bool ValidateHumanSkinTone(SKBitmap bitmap, out float skinRatio)
+    {
+        skinRatio = 0f;
+        int totalPixels = 0;
+        int skinPixels = 0;
+        int greenPixels = 0; // Для отсечения растений
+
+        using var small = bitmap.Resize(new SKImageInfo(64, 64, SKColorType.Rgba8888), SKFilterQuality.Low);
+        if (small == null) return false;
+
+        var pixels = small.Pixels;
+        foreach (var p in pixels)
+        {
+            byte r = p.Red;
+            byte g = p.Green;
+            byte b = p.Blue;
+            totalPixels++;
+
+            // Отсекаем растения: зеленый доминирует над красным
+            if (g > r && g > b)
+            {
+                greenPixels++;
+            }
+
+            // Классическая модель оттенка кожи человека в RGB
+            // R > G > B, достаточная разница и естественные границы
+            if (r > 95 && g > 40 && b > 20 &&
+                (Math.Max(r, Math.Max(g, b)) - Math.Min(r, Math.Min(g, b))) > 15 &&
+                Math.Abs(r - g) > 15 && r > g && r > b)
+            {
+                // Проверка в YCbCr: Cb в [77, 127], Cr в [133, 173]
+                double cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+                double cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+
+                if (cb >= 77 && cb <= 130 && cr >= 133 && cr <= 175)
+                {
+                    skinPixels++;
+                }
+            }
+        }
+
+        if (totalPixels == 0) return false;
+
+        // Если в кадре много зелени (растения/листья) — это точно не лицо
+        if ((float)greenPixels / totalPixels > 0.20f) return false;
+
+        skinRatio = (float)skinPixels / totalPixels;
+
+        // Человеческое лицо в фокусе должно содержать от 25% до 85% тона кожи
+        return skinRatio >= 0.25f && skinRatio <= 0.85f;
+    }
+
+    private bool ValidateFacialLuminanceStructure(SKBitmap bitmap)
+    {
+        using var small = bitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Low);
+        if (small == null) return false;
+
+        var bytes = small.GetPixelSpan();
+        if (bytes.Length < 1024) return false;
+
+        // Верхняя треть (глаза/брови)
+        float topLuma = 0;
+        for (int i = 0; i < 32 * 10; i++) topLuma += bytes[i];
+        topLuma /= (32 * 10);
+
+        // Средняя треть (нос/щеки)
+        float midLuma = 0;
+        for (int i = 32 * 10; i < 32 * 22; i++) midLuma += bytes[i];
+        midLuma /= (32 * 12);
+
+        // У лица средняя часть (нос, лоб, щеки) обычно ярче зоны глаз/волос
+        // Плоские стены, асфальт или случайные текстуры этого градиента не имеют
+        return Math.Abs(midLuma - topLuma) > 4;
+    }
+
     private float[] ComputeNormalizedFeatureVector(SKBitmap faceBitmap, int vectorLength)
     {
-        using var resized = faceBitmap.Resize(new SKImageInfo(64, 64, SKColorType.Gray8), SKFilterQuality.Medium);
+        using var resized = faceBitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Medium);
         var source = resized ?? faceBitmap;
 
         var vector = new float[vectorLength];
-        int pixelsPerBucket = (source.Width * source.Height) / vectorLength;
-        if (pixelsPerBucket < 1) pixelsPerBucket = 1;
-
         var pixels = source.GetPixelSpan();
-        int bucketIndex = 0;
-        float sum = 0;
-        int count = 0;
+        int step = pixels.Length / vectorLength;
+        if (step < 1) step = 1;
 
-        for (int i = 0; i < pixels.Length && bucketIndex < vectorLength; i++)
+        for (int i = 0; i < vectorLength && (i * step) < pixels.Length; i++)
         {
-            sum += pixels[i];
-            count++;
-            if (count >= pixelsPerBucket)
-            {
-                vector[bucketIndex] = sum / count;
-                bucketIndex++;
-                sum = 0;
-                count = 0;
-            }
+            vector[i] = pixels[i * step];
         }
 
         double norm = 0;

@@ -400,7 +400,7 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 using var db = new AppDbContext();
-                var totalFaces = await db.PersonFaces.CountAsync();
+                var totalFaces = await db.PersonFaces.CountAsync(f => f.PersonId != -1);
                 var peopleList = await db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
 
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
@@ -481,7 +481,7 @@ public partial class MainViewModel : ObservableObject
                     .Select(f => f.MediaItem)
                     .Distinct()
                     .OrderByDescending(m => m.FileCreatedAt)
-                    .Take(40)
+                    .Take(50)
                     .ToListAsync();
 
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
@@ -502,12 +502,12 @@ public partial class MainViewModel : ObservableObject
     {
         if (item == null || item.SelectedPerson == null)
         {
-            System.Windows.MessageBox.Show("Выберите человека для привязки лица!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
+            System.Windows.MessageBox.Show("Выберите человека из списка!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        int matched = await _faceService.AssignFaceAndPropagateAsync(item.FaceId, item.SelectedPerson.Id);
-        _auditLogger.Log("Info", "Faces", $"Лицо привязано к '{item.SelectedPerson.Name}'. Автоматически сопоставлено и привязано {matched} фото!");
+        await _faceService.AssignFaceToPersonAsync(item.FaceId, item.SelectedPerson.Id);
+        _auditLogger.Log("Info", "Faces", $"Фото '{item.FileName}' привязано к человеку '{item.SelectedPerson.Name}'.");
 
         RefreshFaceStats();
         await LoadUnassignedFacesAsync();
@@ -515,16 +515,70 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task AutoMatchAllFacesAsync()
+    private async Task IgnoreFaceAsync(UnassignedFaceItemViewModel? item)
     {
-        StatusText = "⏳ Сопоставление лиц во всем архиве...";
-        int count = await _faceService.AutoMatchAllUnassignedFacesAsync();
-        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
-        _auditLogger.Log("Info", "Faces", $"Автоматическое сопоставление завершено. Найдено и привязано {count} новых лиц к членам семьи/друзьям!");
-        
-        RefreshFaceStats();
+        if (item == null) return;
+        await _faceService.IgnoreFaceAsync(item.FaceId);
+        _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто).");
         await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task DeleteFalseFaceAsync(UnassignedFaceItemViewModel? item)
+    {
+        if (item == null) return;
+        await _faceService.DeleteFaceAsync(item.FaceId);
+        _auditLogger.Log("Info", "Faces", $"Удалено ошибочное распознавание лица на '{item.FileName}'.");
+        await LoadUnassignedFacesAsync();
+        RefreshFaceStats();
+    }
+
+    [RelayCommand]
+    private async Task UnassignPhotoFromPersonAsync(MediaItem? photo)
+    {
+        if (photo == null || SelectedPerson == null) return;
+
+        using var db = new AppDbContext();
+        var faces = await db.PersonFaces
+            .Where(f => f.MediaItemId == photo.Id && f.PersonId == SelectedPerson.Id)
+            .ToListAsync();
+
+        foreach (var f in faces)
+        {
+            f.PersonId = null;
+        }
+        await db.SaveChangesAsync();
+
+        _auditLogger.Log("Info", "Faces", $"Фото '{photo.FileName}' отвязано от '{SelectedPerson.Name}'.");
+        RefreshFaceStats();
         LoadPhotosForSelectedPerson(SelectedPerson);
+        await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task ResetAllFaceAssignmentsAsync()
+    {
+        if (System.Windows.MessageBox.Show("Сбросить все привязки фотографий к людям? Фотографии останутся на диске, но альбомы людей вернутся в исходное состояние.", "Сброс привязок", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+        {
+            await _faceService.ResetAllAssignmentsAsync();
+            _auditLogger.Log("Info", "Faces", "Все привязки фотографий к людям были сброшены.");
+            RefreshFaceStats();
+            await LoadUnassignedFacesAsync();
+            LoadPhotosForSelectedPerson(SelectedPerson);
+        }
+    }
+
+    [RelayCommand]
+    private async Task ClearAndRescanFacesAsync()
+    {
+        if (System.Windows.MessageBox.Show("Удалить старые сканы лиц и пересканировать архив заново с точным фильтром людей (исключая растения и фоны)?", "Очистка и пересканирование", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+        {
+            await _faceService.ClearAllFacesAndResetAsync();
+            _auditLogger.Log("Info", "Faces", "База лиц очищена от старых сканов. Запускается чистое сканирование...");
+            RefreshFaceStats();
+            await LoadUnassignedFacesAsync();
+            StartFaceIndexing();
+        }
     }
 
     [RelayCommand]
