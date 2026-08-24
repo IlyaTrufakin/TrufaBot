@@ -1,4 +1,5 @@
-﻿using System.Collections.ObjectModel;
+﻿using TrufaBot.Infrastructure.Storage;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Text.Json;
 using System.Windows;
@@ -36,11 +37,26 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
     private Person? _selectedPerson;
 }
 
+public partial class PersonPhotoItemViewModel : ObservableObject
+{
+    public long MediaItemId { get; set; }
+    public string FileName { get; set; } = "";
+    public string RelativePath { get; set; } = "";
+    public string FullImagePath { get; set; } = "";
+    
+    [ObservableProperty]
+    private string _thumbnailPath = "";
+
+    public string? AIDescription { get; set; }
+    public DateTime FileCreatedAt { get; set; }
+}
+
 public partial class MainViewModel : ObservableObject
 {
     private readonly IAuditLogger _auditLogger;
     private readonly TelegramBotService _botService;
     private readonly IStorageSyncService _syncService;
+    private readonly IThumbnailService _thumbnailService;
     private readonly IAiVisionService _aiVisionService;
     private readonly IFaceRecognitionService _faceService;
     private readonly FaceIndexingService _faceIndexingService;
@@ -176,12 +192,13 @@ public partial class MainViewModel : ObservableObject
     private ObservableCollection<UnassignedFaceItemViewModel> _unassignedFaces = new();
 
     [ObservableProperty]
-    private ObservableCollection<MediaItem> _selectedPersonPhotos = new();
+    private ObservableCollection<PersonPhotoItemViewModel> _selectedPersonPhotos = new();
 
     public MainViewModel(
         IAuditLogger auditLogger, 
         TelegramBotService botService, 
         IStorageSyncService syncService,
+        IThumbnailService thumbnailService,
         IAiVisionService aiVisionService,
         IFaceRecognitionService faceService,
         FaceIndexingService faceIndexingService,
@@ -190,6 +207,7 @@ public partial class MainViewModel : ObservableObject
         _auditLogger = auditLogger;
         _botService = botService;
         _syncService = syncService;
+        _thumbnailService = thumbnailService;
         _aiVisionService = aiVisionService;
         _faceService = faceService;
         _faceIndexingService = faceIndexingService;
@@ -400,7 +418,7 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 using var db = new AppDbContext();
-                var totalFaces = await db.PersonFaces.CountAsync(f => f.PersonId != -1);
+                var totalFaces = await db.PersonFaces.CountAsync(f => !f.IsIgnored);
                 var peopleList = await db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
 
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
@@ -480,19 +498,38 @@ public partial class MainViewModel : ObservableObject
                 var photos = await db.PersonFaces
                     .Include(f => f.MediaItem)
                     .ThenInclude(m => m.StorageSource)
-                    .Where(f => f.PersonId == person.Id && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .Where(f => f.PersonId == person.Id && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
                     .Select(f => f.MediaItem)
                     .Distinct()
                     .OrderByDescending(m => m.FileCreatedAt)
                     .Take(50)
                     .ToListAsync();
 
+                var viewModels = new List<PersonPhotoItemViewModel>();
+
+                foreach (var photo in photos)
+                {
+                    var fullPath = Path.Combine(photo.StorageSource.RootPath, photo.RelativePath.Replace('/', '\\'));
+                    var thumb = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 240, 240);
+
+                    viewModels.Add(new PersonPhotoItemViewModel
+                    {
+                        MediaItemId = photo.Id,
+                        FileName = photo.FileName,
+                        RelativePath = photo.RelativePath,
+                        FullImagePath = fullPath,
+                        ThumbnailPath = thumb,
+                        AIDescription = photo.AIDescription,
+                        FileCreatedAt = photo.FileCreatedAt
+                    });
+                }
+
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     SelectedPersonPhotos.Clear();
-                    foreach (var photo in photos)
+                    foreach (var vm in viewModels)
                     {
-                        SelectedPersonPhotos.Add(photo);
+                        SelectedPersonPhotos.Add(vm);
                     }
                 });
             }
@@ -552,25 +589,33 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task UnassignPhotoFromPersonAsync(MediaItem? photo)
+    private async Task UnassignPhotoFromPersonAsync(PersonPhotoItemViewModel? photoItem)
     {
-        if (photo == null || SelectedPerson == null) return;
+        if (photoItem == null || SelectedPerson == null) return;
 
-        using var db = new AppDbContext();
-        var faces = await db.PersonFaces
-            .Where(f => f.MediaItemId == photo.Id && f.PersonId == SelectedPerson.Id)
-            .ToListAsync();
-
-        foreach (var f in faces)
+        try
         {
-            f.PersonId = null;
-        }
-        await db.SaveChangesAsync();
+            using var db = new AppDbContext();
+            var faces = await db.PersonFaces
+                .Where(f => f.MediaItemId == photoItem.MediaItemId && f.PersonId == SelectedPerson.Id)
+                .ToListAsync();
 
-        _auditLogger.Log("Info", "Faces", $"Фото '{photo.FileName}' отвязано от '{SelectedPerson.Name}'.");
-        RefreshFaceStats();
-        LoadPhotosForSelectedPerson(SelectedPerson);
-        await LoadUnassignedFacesAsync();
+            foreach (var f in faces)
+            {
+                f.PersonId = null;
+            }
+            await db.SaveChangesAsync();
+
+            _auditLogger.Log("Info", "Faces", $"Фото '{photoItem.FileName}' успешно отвязано от '{SelectedPerson.Name}'.");
+            
+            SelectedPersonPhotos.Remove(photoItem);
+            RefreshFaceStats();
+            await LoadUnassignedFacesAsync();
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка отвязки фото: {ex.Message}");
+        }
     }
 
     [RelayCommand]
@@ -603,6 +648,7 @@ public partial class MainViewModel : ObservableObject
     private async Task RefreshFacesListAsync()
     {
         await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
     }
 
     [RelayCommand]
