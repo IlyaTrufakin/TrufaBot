@@ -70,7 +70,7 @@ public class FaceIndexingService
                 .OrderBy(m => m.Id)
                 .ToListAsync(ct);
 
-            // Обрабатываем ТОЛЬКО новые / несканированные фотографии, чтобы НЕ затирать существующие привязки
+            // Обрабатываем ТОЛЬКО несканированные фотографии
             var unindexedPhotoItems = items
                 .Where(m => SupportedImageExtensions.Contains(m.FileExtension) && !scannedSet.Contains(m.Id))
                 .ToList();
@@ -85,7 +85,7 @@ public class FaceIndexingService
                 {
                     TotalCount = 0,
                     ProcessedCount = 0,
-                    StatusMessage = "Все фотографии в архиве уже просканированы нейросетью!",
+                    StatusMessage = "Все фотографии в архиве уже просканированы!",
                     IsCompleted = true
                 });
                 return;
@@ -123,13 +123,14 @@ public class FaceIndexingService
                             var face = new PersonFace
                             {
                                 MediaItemId = item.Id,
-                                PersonId = d.MatchedPersonId,
+                                PersonId = null, // ВСЕГДА NULL при сканировании! Привязка делается ТОЛЬКО пользователем
                                 BoxX = d.BoxX,
                                 BoxY = d.BoxY,
                                 BoxWidth = d.BoxWidth,
                                 BoxHeight = d.BoxHeight,
                                 Embedding = FaceRecognitionService.EncodeEmbedding(d.Embedding),
                                 Confidence = d.Confidence,
+                                IsIgnored = false,
                                 DetectedAt = DateTime.UtcNow
                             };
                             db.PersonFaces.Add(face);
@@ -145,7 +146,7 @@ public class FaceIndexingService
                     TotalCount = total,
                     ProcessedCount = processed,
                     CurrentFile = item.FileName,
-                    StatusMessage = $"Обработано {processed} из {total} (найдено {totalFacesFound} лиц людей)"
+                    StatusMessage = $"Обработано {processed} из {total} (найдено {totalFacesFound} лиц)"
                 });
             }
 
@@ -153,11 +154,11 @@ public class FaceIndexingService
             {
                 TotalCount = total,
                 ProcessedCount = processed,
-                StatusMessage = $"Сканирование завершено! Найдено {totalFacesFound} лиц людей.",
+                StatusMessage = $"Сканирование завершено! Найдено {totalFacesFound} лиц.",
                 IsCompleted = true
             });
 
-            _logger.Log("Info", "Faces", $"Сканирование завершено. Обработано {processed} новых фото, обнаружено {totalFacesFound} лиц людей.");
+            _logger.Log("Info", "Faces", $"Сканирование завершено. Обработано {processed} фото, найдено {totalFacesFound} лиц.");
         }
         catch (OperationCanceledException)
         {

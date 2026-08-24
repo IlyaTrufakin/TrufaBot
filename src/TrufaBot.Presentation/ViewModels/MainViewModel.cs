@@ -511,8 +511,6 @@ public partial class MainViewModel : ObservableObject
                 .ToListAsync();
 
             var list = new List<UnassignedFaceItemViewModel>();
-            var defaultPerson = People.FirstOrDefault();
-
             foreach (var face in unassigned)
             {
                 var fullPath = Path.Combine(face.MediaItem.StorageSource.RootPath, face.MediaItem.RelativePath.Replace('/', '\\'));
@@ -525,7 +523,7 @@ public partial class MainViewModel : ObservableObject
                     FileName = face.MediaItem.FileName,
                     FullImagePath = fullPath,
                     CropThumbnailPath = cropPath,
-                    SelectedPerson = defaultPerson
+                    SelectedPerson = null
                 });
             }
 
@@ -605,16 +603,26 @@ public partial class MainViewModel : ObservableObject
     {
         if (item == null || item.SelectedPerson == null)
         {
-            System.Windows.MessageBox.Show("Выберите человека из списка!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
+            System.Windows.MessageBox.Show("Пожалуйста, сначала выберите человека в выпадающем списке на карточке лица!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        await _faceService.AssignFaceToPersonAsync(item.FaceId, item.SelectedPerson.Id);
-        _auditLogger.Log("Info", "Faces", $"Фото '{item.FileName}' привязано к человеку '{item.SelectedPerson.Name}'.");
+        var personId = item.SelectedPerson.Id;
+        var personName = item.SelectedPerson.Name;
 
-        RefreshFaceStats();
-        await LoadUnassignedFacesAsync();
-        LoadPhotosForSelectedPerson(SelectedPerson);
+        try
+        {
+            await _faceService.AssignFaceToPersonAsync(item.FaceId, personId);
+            _auditLogger.Log("Info", "Faces", $"Лицо на фото '{item.FileName}' привязано к '{personName}'.");
+
+            UnassignedFaces.Remove(item);
+            RefreshFaceStats();
+            LoadPhotosForSelectedPerson(SelectedPerson);
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка привязки лица: {ex.Message}");
+        }
     }
 
     [RelayCommand]
@@ -625,7 +633,7 @@ public partial class MainViewModel : ObservableObject
         {
             await _faceService.IgnoreFaceAsync(item.FaceId);
             _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто).");
-            await LoadUnassignedFacesAsync();
+            UnassignedFaces.Remove(item);
             RefreshFaceStats();
         }
         catch (Exception ex)
@@ -642,7 +650,7 @@ public partial class MainViewModel : ObservableObject
         {
             await _faceService.DeleteFaceAsync(item.FaceId);
             _auditLogger.Log("Info", "Faces", $"Удалено ошибочное распознавание лица на '{item.FileName}'.");
-            await LoadUnassignedFacesAsync();
+            UnassignedFaces.Remove(item);
             RefreshFaceStats();
         }
         catch (Exception ex)

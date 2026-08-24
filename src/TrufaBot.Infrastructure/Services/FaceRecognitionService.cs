@@ -83,49 +83,14 @@ public class FaceRecognitionService : IFaceRecognitionService
             using var bitmap = SKBitmap.Decode(codec);
             if (bitmap == null || bitmap.Width < 40 || bitmap.Height < 40) return results;
 
+            // Используем только глубокую нейросеть UltraFace для детекции реальных лиц
             var detectedFaces = await Task.Run(() => RunUltraFaceDetection(bitmap), ct);
-            if (!detectedFaces.Any()) return results;
-
-            using var db = new AppDbContext();
-            var knownFaces = await db.PersonFaces
-                .Include(f => f.Person)
-                .Where(f => f.PersonId != null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
-                .ToListAsync(ct);
-
-            foreach (var face in detectedFaces)
-            {
-                int? bestPersonId = null;
-                string? bestPersonName = null;
-                float bestSimilarity = 0f;
-
-                foreach (var known in knownFaces)
-                {
-                    var knownVector = DecodeEmbedding(known.Embedding!);
-                    if (knownVector == null || knownVector.Length != face.Embedding.Length) continue;
-
-                    var sim = (float)CalculateCosineSimilarity(face.Embedding, knownVector);
-                    if (sim > bestSimilarity)
-                    {
-                        bestSimilarity = sim;
-                        if (sim >= 0.72f)
-                        {
-                            bestPersonId = known.PersonId;
-                            bestPersonName = known.Person?.Name;
-                        }
-                    }
-                }
-
-                face.MatchedPersonId = bestPersonId;
-                face.MatchedPersonName = bestPersonName;
-                face.SimilarityScore = bestSimilarity;
-                results.Add(face);
-            }
+            return detectedFaces;
         }
         catch
         {
+            return results;
         }
-
-        return results;
     }
 
     private List<DetectedFaceResult> RunUltraFaceDetection(SKBitmap originalBitmap)
@@ -137,7 +102,7 @@ public class FaceRecognitionService : IFaceRecognitionService
             if (_session == null)
             {
                 InitializeSession();
-                if (_session == null) return list; // Без нейросети не создаем ложные детекции
+                if (_session == null) return list;
             }
 
             const int inputW = 320;
@@ -154,7 +119,6 @@ public class FaceRecognitionService : IFaceRecognitionService
                 for (int x = 0; x < inputW; x++)
                 {
                     var pixel = pixels[y * inputW + x];
-                    // Нормализация UltraFace: (val - 127.0) / 128.0
                     inputTensor[0, 0, y, x] = (pixel.Red - 127.0f) / 128.0f;
                     inputTensor[0, 1, y, x] = (pixel.Green - 127.0f) / 128.0f;
                     inputTensor[0, 2, y, x] = (pixel.Blue - 127.0f) / 128.0f;
@@ -177,8 +141,8 @@ public class FaceRecognitionService : IFaceRecognitionService
 
             for (int i = 0; i < numBoxes; i++)
             {
-                float score = scoresTensor[0, i, 1]; // Вероятность лица
-                if (score > 0.70f) // Высокий порог уверенности нейросети
+                float score = scoresTensor[0, i, 1];
+                if (score > 0.70f)
                 {
                     float x1 = Math.Clamp(boxesTensor[0, i, 0], 0f, 1f);
                     float y1 = Math.Clamp(boxesTensor[0, i, 1], 0f, 1f);
@@ -195,7 +159,6 @@ public class FaceRecognitionService : IFaceRecognitionService
                 }
             }
 
-            // Non-Maximum Suppression (NMS) для удаления дубликатов одного лица
             var finalBoxes = ApplyNMS(candidateBoxes, 0.40f);
 
             int origW = originalBitmap.Width;
@@ -225,7 +188,9 @@ public class FaceRecognitionService : IFaceRecognitionService
                         BoxWidth = bw,
                         BoxHeight = bh,
                         Confidence = b.Score,
-                        Embedding = embedding
+                        Embedding = embedding,
+                        MatchedPersonId = null,
+                        MatchedPersonName = null
                     });
                 }
             }
