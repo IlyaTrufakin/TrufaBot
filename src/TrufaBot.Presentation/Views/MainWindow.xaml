@@ -541,18 +541,20 @@
                                     </StackPanel>
 
                                     <StackPanel Grid.Column="2" Orientation="Horizontal">
-                                        <Button Content="▶ Сканировать новые фото" Command="{Binding StartFaceIndexingCommand}" 
-                                                Padding="12,6" Margin="0,0,8,0" Background="#A6E3A1" Foreground="#11111B" FontWeight="Bold" 
-                                                ToolTip="Сканирует только новые фото. Существующие привязки людей НЕ сбрасываются."/>
+                                        <Button Content="⚡ Распознать всех людей по архиву" Command="{Binding AutoMatchAllFacesCommand}" 
+                                                Padding="12,6" Margin="0,0,8,0" Background="#F9E2AF" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Используя ваши размеченные образцы (1-2 фото на человека), нейросеть автоматически найдет и привяжет все их фото в архиве 16 000 кадров!"/>
+                                        <Button Content="▶ Сканировать новые" Command="{Binding StartFaceIndexingCommand}" 
+                                                Padding="10,6" Margin="0,0,8,0" Background="#A6E3A1" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Сканирует только новые фото. Ваши существующие привязки НЕ сбрасываются."/>
                                         <Button Content="⏹ Стоп" Command="{Binding StopFaceIndexingCommand}" 
-                                                Padding="10,6" Margin="0,0,8,0" Background="#585B70" Foreground="#FFFFFF" FontWeight="Bold"
-                                                ToolTip="Приостановить процесс сканирования"/>
-                                        <Button Content="🔄 Сбросить привязки" Command="{Binding ResetAllFaceAssignmentsCommand}" 
-                                                Padding="10,6" Margin="0,0,8,0" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" 
-                                                ToolTip="Отвязать все фото от людей (вернуть в неразмеченные)"/>
-                                        <Button Content="🧹 Полная пересканировка" Command="{Binding ClearAndRescanFacesCommand}" 
-                                                Padding="10,6" Background="#F9E2AF" Foreground="#11111B" FontWeight="Bold" 
-                                                ToolTip="Очистить старую базу со следами природы и пересканировать всё нейросетью UltraFace с нуля"/>
+                                                Padding="8,6" Margin="0,0,8,0" Background="#585B70" Foreground="#FFFFFF" FontWeight="Bold"/>
+                                        <Button Content="🔄 Сбросить" Command="{Binding ResetAllFaceAssignmentsCommand}" 
+                                                Padding="8,6" Margin="0,0,8,0" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Отвязать все фото от людей"/>
+                                        <Button Content="🧹 С нуля" Command="{Binding ClearAndRescanFacesCommand}" 
+                                                Padding="8,6" Background="#313244" Foreground="#CDD6F4" FontSize="11" 
+                                                ToolTip="Полная пересканировка"/>
                                     </StackPanel>
                                 </Grid>
 

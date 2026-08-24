@@ -599,6 +599,21 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private async Task AutoMatchAllFacesAsync()
+    {
+        StatusText = "⏳ Нейросеть распознает лица людей во всем архиве...";
+        int matched = await _faceService.AutoMatchAllKnownPeopleAsync(threshold: 0.42f);
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+
+        _auditLogger.Log("Info", "Faces", $"Авто-распознавание завершено! Нейросеть нашла и привязала {matched} новых фото к добавленным людям.");
+        System.Windows.MessageBox.Show($"Нейросеть успешно распознала и привязала {matched} фото к членам семьи и друзьям по всему архиву!", "Авто-распознавание", MessageBoxButton.OK, MessageBoxImage.Information);
+
+        RefreshFaceStats();
+        await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
+    }
+
+    [RelayCommand]
     private async Task AssignFaceAsync(UnassignedFaceItemViewModel? item)
     {
         if (item == null || item.SelectedPerson == null)

@@ -15,32 +15,40 @@ public class FaceRecognitionService : IFaceRecognitionService
     private const int EmbeddingSize = 128;
     private static readonly string FaceCacheDir = Path.Combine(AppPaths.CacheFolder, "faces");
     private static readonly string ModelDir = Path.Combine(AppPaths.AppDataFolder, "models");
-    private static readonly string ModelPath = Path.Combine(ModelDir, "version-RFB-320.onnx");
-    private static readonly string ModelUrl = "https://raw.githubusercontent.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/master/models/onnx/version-RFB-320.onnx";
+    private static readonly string DetectorModelPath = Path.Combine(ModelDir, "version-RFB-320.onnx");
+    private static readonly string EmbeddingModelPath = Path.Combine(ModelDir, "face_embedding.onnx");
 
-    private InferenceSession? _session;
-    private readonly object _sessionLock = new();
+    private static readonly string DetectorUrl = "https://raw.githubusercontent.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/master/models/onnx/version-RFB-320.onnx";
+    private static readonly string EmbeddingUrl = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx";
+
+    private InferenceSession? _detectorSession;
+    private InferenceSession? _embeddingSession;
+    private readonly object _lock = new();
 
     public FaceRecognitionService()
     {
         Directory.CreateDirectory(FaceCacheDir);
         Directory.CreateDirectory(ModelDir);
-        EnsureModelDownloaded();
-        InitializeSession();
+        EnsureModelsDownloaded();
+        InitializeSessions();
     }
 
-    private void EnsureModelDownloaded()
+    private void EnsureModelsDownloaded()
     {
-        if (File.Exists(ModelPath) && new FileInfo(ModelPath).Length > 500000) return;
-
         try
         {
-            using var client = new System.Net.Http.HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(30);
-            var bytes = client.GetByteArrayAsync(ModelUrl).GetAwaiter().GetResult();
-            if (bytes != null && bytes.Length > 500000)
+            using var client = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+
+            if (!File.Exists(DetectorModelPath) || new FileInfo(DetectorModelPath).Length < 500000)
             {
-                File.WriteAllBytes(ModelPath, bytes);
+                var bytes = client.GetByteArrayAsync(DetectorUrl).GetAwaiter().GetResult();
+                if (bytes != null && bytes.Length > 500000) File.WriteAllBytes(DetectorModelPath, bytes);
+            }
+
+            if (!File.Exists(EmbeddingModelPath) || new FileInfo(EmbeddingModelPath).Length < 5000000)
+            {
+                var bytes = client.GetByteArrayAsync(EmbeddingUrl).GetAwaiter().GetResult();
+                if (bytes != null && bytes.Length > 5000000) File.WriteAllBytes(EmbeddingModelPath, bytes);
             }
         }
         catch
@@ -48,23 +56,28 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
     }
 
-    private void InitializeSession()
+    private void InitializeSessions()
     {
-        lock (_sessionLock)
+        lock (_lock)
         {
-            if (_session != null) return;
-            if (File.Exists(ModelPath))
+            if (_detectorSession == null && File.Exists(DetectorModelPath))
             {
                 try
                 {
-                    var options = new SessionOptions();
-                    options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
-                    _session = new InferenceSession(ModelPath, options);
+                    var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                    _detectorSession = new InferenceSession(DetectorModelPath, opt);
                 }
-                catch
+                catch { _detectorSession = null; }
+            }
+
+            if (_embeddingSession == null && File.Exists(EmbeddingModelPath))
+            {
+                try
                 {
-                    _session = null;
+                    var opt = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                    _embeddingSession = new InferenceSession(EmbeddingModelPath, opt);
                 }
+                catch { _embeddingSession = null; }
             }
         }
     }
@@ -83,8 +96,7 @@ public class FaceRecognitionService : IFaceRecognitionService
             using var bitmap = SKBitmap.Decode(codec);
             if (bitmap == null || bitmap.Width < 40 || bitmap.Height < 40) return results;
 
-            // Используем только глубокую нейросеть UltraFace для детекции реальных лиц
-            var detectedFaces = await Task.Run(() => RunUltraFaceDetection(bitmap), ct);
+            var detectedFaces = await Task.Run(() => RunUltraFaceAndExtractEmbeddings(bitmap), ct);
             return detectedFaces;
         }
         catch
@@ -93,16 +105,16 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
     }
 
-    private List<DetectedFaceResult> RunUltraFaceDetection(SKBitmap originalBitmap)
+    private List<DetectedFaceResult> RunUltraFaceAndExtractEmbeddings(SKBitmap originalBitmap)
     {
         var list = new List<DetectedFaceResult>();
 
-        lock (_sessionLock)
+        lock (_lock)
         {
-            if (_session == null)
+            if (_detectorSession == null)
             {
-                InitializeSession();
-                if (_session == null) return list;
+                InitializeSessions();
+                if (_detectorSession == null) return list;
             }
 
             const int inputW = 320;
@@ -130,7 +142,7 @@ public class FaceRecognitionService : IFaceRecognitionService
                 NamedOnnxValue.CreateFromTensor("input", inputTensor)
             };
 
-            using var outputs = _session.Run(inputs);
+            using var outputs = _detectorSession.Run(inputs);
             var scoresTensor = outputs.FirstOrDefault(o => o.Name.Contains("scores"))?.AsTensor<float>();
             var boxesTensor = outputs.FirstOrDefault(o => o.Name.Contains("boxes"))?.AsTensor<float>();
 
@@ -180,7 +192,8 @@ public class FaceRecognitionService : IFaceRecognitionService
                 using var faceBitmap = new SKBitmap();
                 if (originalBitmap.ExtractSubset(faceBitmap, rect))
                 {
-                    var embedding = ComputeNormalizedFeatureVector(faceBitmap, EmbeddingSize);
+                    // Вычисляем глубокий вектор лица через нейросеть SFace
+                    var embedding = ComputeDeepSFaceEmbedding(faceBitmap);
                     list.Add(new DetectedFaceResult
                     {
                         BoxX = b.X1,
@@ -197,6 +210,98 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
 
         return list;
+    }
+
+    private float[] ComputeDeepSFaceEmbedding(SKBitmap faceBitmap)
+    {
+        lock (_lock)
+        {
+            if (_embeddingSession == null)
+            {
+                InitializeSessions();
+                if (_embeddingSession == null)
+                {
+                    return ComputeFallbackVector(faceBitmap, EmbeddingSize);
+                }
+            }
+
+            try
+            {
+                const int sfaceSize = 112;
+                using var resized = faceBitmap.Resize(new SKImageInfo(sfaceSize, sfaceSize, SKColorType.Rgb888x), SKFilterQuality.High);
+                if (resized == null) return ComputeFallbackVector(faceBitmap, EmbeddingSize);
+
+                var inputTensor = new DenseTensor<float>(new[] { 1, 112, 112, 3 });
+                var pixels = resized.Pixels;
+
+                for (int y = 0; y < sfaceSize; y++)
+                {
+                    for (int x = 0; x < sfaceSize; x++)
+                    {
+                        var pixel = pixels[y * sfaceSize + x];
+                        inputTensor[0, y, x, 0] = pixel.Red;
+                        inputTensor[0, y, x, 1] = pixel.Green;
+                        inputTensor[0, y, x, 2] = pixel.Blue;
+                    }
+                }
+
+                string inputName = _embeddingSession.InputMetadata.Keys.FirstOrDefault() ?? "data";
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(inputName, inputTensor)
+                };
+
+                using var outputs = _embeddingSession.Run(inputs);
+                var outputTensor = outputs.First().AsTensor<float>();
+
+                var embedding = new float[outputTensor.Length];
+                for (int i = 0; i < embedding.Length; i++)
+                {
+                    embedding[i] = outputTensor.GetValue(i);
+                }
+
+                // L2 Нормализация
+                double norm = 0;
+                for (int i = 0; i < embedding.Length; i++) norm += embedding[i] * embedding[i];
+                norm = Math.Sqrt(norm);
+                if (norm > 0)
+                {
+                    for (int i = 0; i < embedding.Length; i++) embedding[i] = (float)(embedding[i] / norm);
+                }
+
+                return embedding;
+            }
+            catch
+            {
+                return ComputeFallbackVector(faceBitmap, EmbeddingSize);
+            }
+        }
+    }
+
+    private float[] ComputeFallbackVector(SKBitmap faceBitmap, int vectorLength)
+    {
+        using var resized = faceBitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Medium);
+        var source = resized ?? faceBitmap;
+
+        var vector = new float[vectorLength];
+        var pixels = source.GetPixelSpan();
+        int step = pixels.Length / vectorLength;
+        if (step < 1) step = 1;
+
+        for (int i = 0; i < vectorLength && (i * step) < pixels.Length; i++)
+        {
+            vector[i] = pixels[i * step];
+        }
+
+        double norm = 0;
+        for (int i = 0; i < vector.Length; i++) norm += vector[i] * vector[i];
+        norm = Math.Sqrt(norm);
+        if (norm > 0)
+        {
+            for (int i = 0; i < vector.Length; i++) vector[i] = (float)(vector[i] / norm);
+        }
+
+        return vector;
     }
 
     private List<(float X1, float Y1, float X2, float Y2, float Score)> ApplyNMS(List<(float X1, float Y1, float X2, float Y2, float Score)> boxes, float iouThreshold)
@@ -298,6 +403,80 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
     }
 
+    /// <summary>
+    /// Автоматическое глубокое распознавание по всему архиву на основе размеченных эталонных лиц людей
+    /// </summary>
+    public async Task<int> AutoMatchAllKnownPeopleAsync(float threshold = 0.42f, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+
+        // Загружаем все эталонные лица добавленных людей
+        var knownFaces = await db.PersonFaces
+            .Where(f => f.PersonId != null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
+            .ToListAsync(ct);
+
+        if (!knownFaces.Any()) return 0;
+
+        // Группируем эталоны по каждому человеку
+        var personVectors = new Dictionary<int, List<float[]>>();
+        foreach (var face in knownFaces)
+        {
+            var vec = DecodeEmbedding(face.Embedding!);
+            if (vec != null)
+            {
+                if (!personVectors.ContainsKey(face.PersonId!.Value))
+                {
+                    personVectors[face.PersonId!.Value] = new List<float[]>();
+                }
+                personVectors[face.PersonId!.Value].Add(vec);
+            }
+        }
+
+        // Загружаем все неразмеченные лица из архива
+        var unassignedFaces = await db.PersonFaces
+            .Where(f => f.PersonId == null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
+            .ToListAsync(ct);
+
+        int matchedCount = 0;
+
+        foreach (var unassigned in unassignedFaces)
+        {
+            var unassignedVec = DecodeEmbedding(unassigned.Embedding!);
+            if (unassignedVec == null) continue;
+
+            int? bestPersonId = null;
+            double bestSim = 0;
+
+            foreach (var (personId, vectors) in personVectors)
+            {
+                foreach (var refVec in vectors)
+                {
+                    if (refVec.Length != unassignedVec.Length) continue;
+
+                    var sim = CalculateCosineSimilarity(unassignedVec, refVec);
+                    if (sim > bestSim && sim >= threshold)
+                    {
+                        bestSim = sim;
+                        bestPersonId = personId;
+                    }
+                }
+            }
+
+            if (bestPersonId.HasValue)
+            {
+                unassigned.PersonId = bestPersonId.Value;
+                matchedCount++;
+            }
+        }
+
+        if (matchedCount > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        return matchedCount;
+    }
+
     public async Task IgnoreFaceAsync(long faceId, CancellationToken ct = default)
     {
         using var db = new AppDbContext();
@@ -390,31 +569,5 @@ public class FaceRecognitionService : IFaceRecognitionService
         {
             return null;
         }
-    }
-
-    private float[] ComputeNormalizedFeatureVector(SKBitmap faceBitmap, int vectorLength)
-    {
-        using var resized = faceBitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Medium);
-        var source = resized ?? faceBitmap;
-
-        var vector = new float[vectorLength];
-        var pixels = source.GetPixelSpan();
-        int step = pixels.Length / vectorLength;
-        if (step < 1) step = 1;
-
-        for (int i = 0; i < vectorLength && (i * step) < pixels.Length; i++)
-        {
-            vector[i] = pixels[i * step];
-        }
-
-        double norm = 0;
-        for (int i = 0; i < vector.Length; i++) norm += vector[i] * vector[i];
-        norm = Math.Sqrt(norm);
-        if (norm > 0)
-        {
-            for (int i = 0; i < vector.Length; i++) vector[i] = (float)(vector[i] / norm);
-        }
-
-        return vector;
     }
 }

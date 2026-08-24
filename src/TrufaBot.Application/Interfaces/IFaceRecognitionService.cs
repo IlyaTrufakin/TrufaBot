@@ -20,6 +20,7 @@ public interface IFaceRecognitionService
     Task<List<DetectedFaceResult>> DetectAndRecognizeFacesAsync(string imagePath, CancellationToken ct = default);
     Task<string> GetOrCreateFaceCropThumbnailAsync(string originalImagePath, float boxX, float boxY, float boxW, float boxH, long faceId, CancellationToken ct = default);
     Task AssignFaceToPersonAsync(long faceId, int personId, CancellationToken ct = default);
+    Task<int> AutoMatchAllKnownPeopleAsync(float threshold = 0.42f, CancellationToken ct = default);
     Task IgnoreFaceAsync(long faceId, CancellationToken ct = default);
     Task DeleteFaceAsync(long faceId, CancellationToken ct = default);
     Task ResetAllAssignmentsAsync(CancellationToken ct = default);
