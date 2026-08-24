@@ -224,49 +224,45 @@ public class TelegramBotService
 
         var buttons = new List<InlineKeyboardButton[]>();
 
-        // 1. Семья
-        var family = people.Where(p => string.Equals(p.Category, "Семья", StringComparison.OrdinalIgnoreCase)).ToList();
-        if (family.Any())
+        var categoriesConfig = new[]
         {
-            for (int i = 0; i < family.Count; i += 2)
+            (Key: "Семья", Icon: "👨‍👩‍👧", Title: "Семья"),
+            (Key: "Родственники", Icon: "🏡", Title: "Родственники"),
+            (Key: "Друзья", Icon: "🎉", Title: "Друзья"),
+            (Key: "Знакомые", Icon: "🤝", Title: "Знакомые"),
+            (Key: "Коллеги", Icon: "💼", Title: "Коллеги")
+        };
+
+        foreach (var cat in categoriesConfig)
+        {
+            var catPeople = people.Where(p => string.Equals(p.Category, cat.Key, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (catPeople.Any())
             {
-                var row = new List<InlineKeyboardButton>();
-                row.Add(InlineKeyboardButton.WithCallbackData($"👨‍👩‍👧 {family[i].Name} ({family[i].Faces.Count})", $"view_person_{family[i].Id}"));
-                if (i + 1 < family.Count)
+                for (int i = 0; i < catPeople.Count; i += 2)
                 {
-                    row.Add(InlineKeyboardButton.WithCallbackData($"👨‍👩‍👧 {family[i + 1].Name} ({family[i + 1].Faces.Count})", $"view_person_{family[i + 1].Id}"));
+                    var row = new List<InlineKeyboardButton>();
+                    row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i].Name} ({catPeople[i].Faces.Count})", $"view_person_{catPeople[i].Id}"));
+                    if (i + 1 < catPeople.Count)
+                    {
+                        row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i + 1].Name} ({catPeople[i + 1].Faces.Count})", $"view_person_{catPeople[i + 1].Id}"));
+                    }
+                    buttons.Add(row.ToArray());
                 }
-                buttons.Add(row.ToArray());
             }
         }
 
-        // 2. Друзья
-        var friends = people.Where(p => string.Equals(p.Category, "Друзья", StringComparison.OrdinalIgnoreCase)).ToList();
-        if (friends.Any())
+        // Любые другие, не вошедшие в 5 категорий
+        var standardKeys = new HashSet<string>(categoriesConfig.Select(c => c.Key), StringComparer.OrdinalIgnoreCase);
+        var otherPeople = people.Where(p => !standardKeys.Contains(p.Category)).ToList();
+        if (otherPeople.Any())
         {
-            for (int i = 0; i < friends.Count; i += 2)
+            for (int i = 0; i < otherPeople.Count; i += 2)
             {
                 var row = new List<InlineKeyboardButton>();
-                row.Add(InlineKeyboardButton.WithCallbackData($"🎉 {friends[i].Name} ({friends[i].Faces.Count})", $"view_person_{friends[i].Id}"));
-                if (i + 1 < friends.Count)
+                row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i].Name} ({otherPeople[i].Faces.Count})", $"view_person_{otherPeople[i].Id}"));
+                if (i + 1 < otherPeople.Count)
                 {
-                    row.Add(InlineKeyboardButton.WithCallbackData($"🎉 {friends[i + 1].Name} ({friends[i + 1].Faces.Count})", $"view_person_{friends[i + 1].Id}"));
-                }
-                buttons.Add(row.ToArray());
-            }
-        }
-
-        // 3. Другие / Коллеги
-        var others = people.Where(p => !string.Equals(p.Category, "Семья", StringComparison.OrdinalIgnoreCase) && !string.Equals(p.Category, "Друзья", StringComparison.OrdinalIgnoreCase)).ToList();
-        if (others.Any())
-        {
-            for (int i = 0; i < others.Count; i += 2)
-            {
-                var row = new List<InlineKeyboardButton>();
-                row.Add(InlineKeyboardButton.WithCallbackData($"👤 {others[i].Name} ({others[i].Faces.Count})", $"view_person_{others[i].Id}"));
-                if (i + 1 < others.Count)
-                {
-                    row.Add(InlineKeyboardButton.WithCallbackData($"👤 {others[i + 1].Name} ({others[i + 1].Faces.Count})", $"view_person_{others[i + 1].Id}"));
+                    row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i + 1].Name} ({otherPeople[i + 1].Faces.Count})", $"view_person_{otherPeople[i + 1].Id}"));
                 }
                 buttons.Add(row.ToArray());
             }
@@ -275,8 +271,8 @@ public class TelegramBotService
         buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu") });
 
         string messageText = people.Any()
-            ? "👥 <b>Выберите человека для просмотра фотоальбома:</b>\n<i>(Разделено по категориям: Семья, Друзья, Коллеги)</i>"
-            : "В базе пока нет добавленных людей.\nДобавьте их в приложении на ПК во вкладке «Люди (Семья, Друзья)».";
+            ? "👥 <b>Выберите человека для просмотра фотоальбома:</b>\n<i>(Семья 👨‍👩‍👧, Родственники 🏡, Друзья 🎉, Знакомые 🤝, Коллеги 💼)</i>"
+            : "В базе пока нет добавленных людей.\nДобавьте их в приложении на ПК во вкладке «Люди».";
 
         if (editMessageId.HasValue)
         {

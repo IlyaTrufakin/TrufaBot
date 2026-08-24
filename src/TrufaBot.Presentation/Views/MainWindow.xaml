@@ -442,7 +442,7 @@
             </TabItem>
 
             <!-- Вкладка 5: Люди (Семья, Друзья, Коллеги) -->
-            <TabItem Header="👥 Люди (Семья, Друзья)">
+            <TabItem Header="👥 Люди (Семья, Родственники, Друзья)">
                 <Grid Margin="15">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="450"/>
@@ -466,7 +466,7 @@
                                     <TextBlock Text="Имя:" Foreground="#FFFFFF" Margin="0,0,0,4"/>
                                     <TextBox Text="{Binding NewPersonName, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,10"/>
                                     
-                                    <TextBlock Text="Категория (Семья, Друг, Коллега):" Foreground="#FFFFFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Категория (Семья, Родственники, Друзья, Знакомые, Коллеги):" Foreground="#FFFFFF" Margin="0,0,0,4"/>
                                     <ComboBox ItemsSource="{Binding AvailablePersonCategories}" SelectedItem="{Binding SelectedPersonCategory}" Margin="0,0,0,10"/>
 
                                     <TextBlock Text="Примечание (родство / статус):" Foreground="#FFFFFF" Margin="0,0,0,4"/>
