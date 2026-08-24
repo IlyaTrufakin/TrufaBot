@@ -3,13 +3,20 @@ using Microsoft.EntityFrameworkCore;
 using SkiaSharp;
 using TrufaBot.Application.Interfaces;
 using TrufaBot.Domain.Entities;
+using TrufaBot.Infrastructure.Common;
 using TrufaBot.Infrastructure.Data;
 
 namespace TrufaBot.Infrastructure.Services;
 
 public class FaceRecognitionService : IFaceRecognitionService
 {
-    private const int EmbeddingSize = 128; // Компактный 128-мерный вектор признаков лица
+    private const int EmbeddingSize = 128;
+    private static readonly string FaceCacheDir = Path.Combine(AppPaths.CacheFolder, "faces");
+
+    public FaceRecognitionService()
+    {
+        Directory.CreateDirectory(FaceCacheDir);
+    }
 
     public async Task<List<DetectedFaceResult>> DetectAndRecognizeFacesAsync(string imagePath, CancellationToken ct = default)
     {
@@ -25,7 +32,6 @@ public class FaceRecognitionService : IFaceRecognitionService
             using var bitmap = SKBitmap.Decode(codec);
             if (bitmap == null || bitmap.Width < 50 || bitmap.Height < 50) return results;
 
-            // Извлекаем лица и формируем векторы признаков (эмбеддинги)
             var detectedFaces = ExtractFaceCrops(bitmap);
 
             using var db = new AppDbContext();
@@ -100,6 +106,149 @@ public class FaceRecognitionService : IFaceRecognitionService
         return bestPersonId;
     }
 
+    public async Task<string> GetOrCreateFaceCropThumbnailAsync(string originalImagePath, float boxX, float boxY, float boxW, float boxH, long faceId, CancellationToken ct = default)
+    {
+        var cropPath = Path.Combine(FaceCacheDir, $"face_{faceId}.jpg");
+        if (File.Exists(cropPath)) return cropPath;
+
+        return await Task.Run(() =>
+        {
+            try
+            {
+                if (!File.Exists(originalImagePath)) return string.Empty;
+
+                using var codec = SKCodec.Create(originalImagePath);
+                if (codec == null) return string.Empty;
+
+                using var originalBitmap = SKBitmap.Decode(codec);
+                if (originalBitmap == null) return string.Empty;
+
+                // Добавляем 15% запас вокруг лица
+                int imgW = originalBitmap.Width;
+                int imgH = originalBitmap.Height;
+
+                float marginX = boxW * 0.15f;
+                float marginY = boxH * 0.15f;
+
+                int x = Math.Max(0, (int)((boxX - marginX) * imgW));
+                int y = Math.Max(0, (int)((boxY - marginY) * imgH));
+                int w = Math.Min(imgW - x, (int)((boxW + marginX * 2) * imgW));
+                int h = Math.Min(imgH - y, (int)((boxH + marginY * 2) * imgH));
+
+                if (w < 20 || h < 20) return string.Empty;
+
+                var rect = new SKRectI(x, y, x + w, y + h);
+                using var faceBitmap = new SKBitmap();
+                if (!originalBitmap.ExtractSubset(faceBitmap, rect)) return string.Empty;
+
+                using var resized = faceBitmap.Resize(new SKImageInfo(160, 160, SKColorType.Rgba8888, SKAlphaType.Premul), SKFilterQuality.Medium);
+                if (resized == null) return string.Empty;
+
+                using var image = SKImage.FromBitmap(resized);
+                using var data = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+                using var stream = File.OpenWrite(cropPath);
+                data.SaveTo(stream);
+
+                return cropPath;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }, ct);
+    }
+
+    public async Task<int> AssignFaceAndPropagateAsync(long faceId, int personId, float threshold = 0.60f, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
+        if (targetFace == null) return 0;
+
+        targetFace.PersonId = personId;
+        int autoAssignedCount = 1;
+
+        if (!string.IsNullOrEmpty(targetFace.Embedding))
+        {
+            var targetVector = DecodeEmbedding(targetFace.Embedding);
+            if (targetVector != null)
+            {
+                // Находим все неразмеченные лица и сравниваем с этим эталоном
+                var unassigned = await db.PersonFaces
+                    .Where(f => f.PersonId == null && !string.IsNullOrEmpty(f.Embedding) && f.Id != faceId)
+                    .ToListAsync(ct);
+
+                foreach (var face in unassigned)
+                {
+                    var vec = DecodeEmbedding(face.Embedding!);
+                    if (vec != null && vec.Length == targetVector.Length)
+                    {
+                        var sim = CalculateCosineSimilarity(targetVector, vec);
+                        if (sim >= threshold)
+                        {
+                            face.PersonId = personId;
+                            autoAssignedCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        await db.SaveChangesAsync(ct);
+        return autoAssignedCount;
+    }
+
+    public async Task<int> AutoMatchAllUnassignedFacesAsync(float threshold = 0.60f, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+
+        var knownFaces = await db.PersonFaces
+            .Where(f => f.PersonId != null && !string.IsNullOrEmpty(f.Embedding))
+            .ToListAsync(ct);
+
+        if (!knownFaces.Any()) return 0;
+
+        var unassignedFaces = await db.PersonFaces
+            .Where(f => f.PersonId == null && !string.IsNullOrEmpty(f.Embedding))
+            .ToListAsync(ct);
+
+        int matchedCount = 0;
+
+        foreach (var unassigned in unassignedFaces)
+        {
+            var unassignedVec = DecodeEmbedding(unassigned.Embedding!);
+            if (unassignedVec == null) continue;
+
+            int? bestPersonId = null;
+            double bestSim = 0;
+
+            foreach (var known in knownFaces)
+            {
+                var knownVec = DecodeEmbedding(known.Embedding!);
+                if (knownVec == null || knownVec.Length != unassignedVec.Length) continue;
+
+                var sim = CalculateCosineSimilarity(unassignedVec, knownVec);
+                if (sim > bestSim && sim >= threshold)
+                {
+                    bestSim = sim;
+                    bestPersonId = known.PersonId;
+                }
+            }
+
+            if (bestPersonId.HasValue)
+            {
+                unassigned.PersonId = bestPersonId.Value;
+                matchedCount++;
+            }
+        }
+
+        if (matchedCount > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        return matchedCount;
+    }
+
     public double CalculateCosineSimilarity(float[] emb1, float[] emb2)
     {
         if (emb1.Length != emb2.Length || emb1.Length == 0) return 0.0;
@@ -144,12 +293,9 @@ public class FaceRecognitionService : IFaceRecognitionService
     private List<DetectedFaceResult> ExtractFaceCrops(SKBitmap bitmap)
     {
         var list = new List<DetectedFaceResult>();
-
-        // Оптимизированный анализ цветовой структуры и портретных зон изображения
         int w = bitmap.Width;
         int h = bitmap.Height;
 
-        // Определяем ключевые композиционные зоны (портретная центральная область)
         var zones = new[]
         {
             new { X = 0.25f, Y = 0.15f, W = 0.50f, H = 0.60f, Conf = 0.85f },
@@ -188,7 +334,6 @@ public class FaceRecognitionService : IFaceRecognitionService
 
     private float[] ComputeNormalizedFeatureVector(SKBitmap faceBitmap, int vectorLength)
     {
-        // Приводим кроп к фиксированному размеру 64x64 в оттенках серого
         using var resized = faceBitmap.Resize(new SKImageInfo(64, 64, SKColorType.Gray8), SKFilterQuality.Medium);
         var source = resized ?? faceBitmap;
 
@@ -214,7 +359,6 @@ public class FaceRecognitionService : IFaceRecognitionService
             }
         }
 
-        // L2 нормализация вектора
         double norm = 0;
         for (int i = 0; i < vector.Length; i++) norm += vector[i] * vector[i];
         norm = Math.Sqrt(norm);

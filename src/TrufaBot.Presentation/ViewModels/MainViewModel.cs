@@ -24,6 +24,18 @@ public class AppConfigModel
     public bool AutoAiIndexing { get; set; } = false;
 }
 
+public partial class UnassignedFaceItemViewModel : ObservableObject
+{
+    public long FaceId { get; set; }
+    public long MediaItemId { get; set; }
+    public string FileName { get; set; } = "";
+    public string FullImagePath { get; set; } = "";
+    public string CropThumbnailPath { get; set; } = "";
+
+    [ObservableProperty]
+    private Person? _selectedPerson;
+}
+
 public partial class MainViewModel : ObservableObject
 {
     private readonly IAuditLogger _auditLogger;
@@ -137,7 +149,7 @@ public partial class MainViewModel : ObservableObject
     private string _selectedPersonCategory = "Семья";
 
     [ObservableProperty]
-    private ObservableCollection<string> _availablePersonCategories = new() { "Семья", "Друзья", "Коллеги", "Знакомые" };
+    private ObservableCollection<string> _availablePersonCategories = new() { "Семья", "Родственники", "Друзья", "Знакомые", "Коллеги" };
 
     [ObservableProperty]
     private string _newPersonNotes = "";
@@ -159,6 +171,12 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private int _totalKnownFacesCount;
+
+    [ObservableProperty]
+    private ObservableCollection<UnassignedFaceItemViewModel> _unassignedFaces = new();
+
+    [ObservableProperty]
+    private ObservableCollection<MediaItem> _selectedPersonPhotos = new();
 
     public MainViewModel(
         IAuditLogger auditLogger, 
@@ -191,6 +209,7 @@ public partial class MainViewModel : ObservableObject
         LoadData();
         RefreshAiStats();
         RefreshFaceStats();
+        _ = LoadUnassignedFacesAsync();
     }
 
     private void OnAiIndexingProgressChanged(object? sender, AiIndexingProgressEventArgs e)
@@ -224,6 +243,7 @@ public partial class MainViewModel : ObservableObject
             {
                 IsFaceIndexingRunning = false;
                 RefreshFaceStats();
+                _ = LoadUnassignedFacesAsync();
             }
         });
     }
@@ -236,6 +256,11 @@ public partial class MainViewModel : ObservableObject
     partial void OnSelectedPermissionSourceChanged(StorageSource? value)
     {
         UpdateAvailableFoldersForSelectedSource();
+    }
+
+    partial void OnSelectedPersonChanged(Person? value)
+    {
+        LoadPhotosForSelectedPerson(value);
     }
 
     private void OnLogAdded(AuditLogEntry entry)
@@ -326,6 +351,11 @@ public partial class MainViewModel : ObservableObject
         {
             SelectedPermissionSource = Sources.First();
         }
+
+        if (SelectedPerson == null && People.Any())
+        {
+            SelectedPerson = People.First();
+        }
     }
 
     public void RefreshAiStats()
@@ -387,6 +417,122 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
+    public async Task LoadUnassignedFacesAsync()
+    {
+        try
+        {
+            using var db = new AppDbContext();
+            var unassigned = await db.PersonFaces
+                .Include(f => f.MediaItem)
+                .ThenInclude(m => m.StorageSource)
+                .Where(f => f.PersonId == null && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                .OrderByDescending(f => f.Id)
+                .Take(12)
+                .ToListAsync();
+
+            var list = new List<UnassignedFaceItemViewModel>();
+            var defaultPerson = People.FirstOrDefault();
+
+            foreach (var face in unassigned)
+            {
+                var fullPath = Path.Combine(face.MediaItem.StorageSource.RootPath, face.MediaItem.RelativePath.Replace('/', '\\'));
+                var cropPath = await _faceService.GetOrCreateFaceCropThumbnailAsync(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight, face.Id);
+
+                list.Add(new UnassignedFaceItemViewModel
+                {
+                    FaceId = face.Id,
+                    MediaItemId = face.MediaItemId,
+                    FileName = face.MediaItem.FileName,
+                    FullImagePath = fullPath,
+                    CropThumbnailPath = cropPath,
+                    SelectedPerson = defaultPerson
+                });
+            }
+
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            {
+                UnassignedFaces.Clear();
+                foreach (var item in list)
+                {
+                    UnassignedFaces.Add(item);
+                }
+            });
+        }
+        catch { }
+    }
+
+    private void LoadPhotosForSelectedPerson(Person? person)
+    {
+        if (person == null)
+        {
+            SelectedPersonPhotos.Clear();
+            return;
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                using var db = new AppDbContext();
+                var photos = await db.PersonFaces
+                    .Include(f => f.MediaItem)
+                    .ThenInclude(m => m.StorageSource)
+                    .Where(f => f.PersonId == person.Id && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .Select(f => f.MediaItem)
+                    .Distinct()
+                    .OrderByDescending(m => m.FileCreatedAt)
+                    .Take(40)
+                    .ToListAsync();
+
+                System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                {
+                    SelectedPersonPhotos.Clear();
+                    foreach (var photo in photos)
+                    {
+                        SelectedPersonPhotos.Add(photo);
+                    }
+                });
+            }
+            catch { }
+        });
+    }
+
+    [RelayCommand]
+    private async Task AssignFaceAsync(UnassignedFaceItemViewModel? item)
+    {
+        if (item == null || item.SelectedPerson == null)
+        {
+            System.Windows.MessageBox.Show("Выберите человека для привязки лица!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        int matched = await _faceService.AssignFaceAndPropagateAsync(item.FaceId, item.SelectedPerson.Id);
+        _auditLogger.Log("Info", "Faces", $"Лицо привязано к '{item.SelectedPerson.Name}'. Автоматически сопоставлено и привязано {matched} фото!");
+
+        RefreshFaceStats();
+        await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
+    }
+
+    [RelayCommand]
+    private async Task AutoMatchAllFacesAsync()
+    {
+        StatusText = "⏳ Сопоставление лиц во всем архиве...";
+        int count = await _faceService.AutoMatchAllUnassignedFacesAsync();
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+        _auditLogger.Log("Info", "Faces", $"Автоматическое сопоставление завершено. Найдено и привязано {count} новых лиц к членам семьи/друзьям!");
+        
+        RefreshFaceStats();
+        await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
+    }
+
+    [RelayCommand]
+    private async Task RefreshFacesListAsync()
+    {
+        await LoadUnassignedFacesAsync();
+    }
+
     [RelayCommand]
     private async Task AddPersonAsync()
     {
@@ -435,6 +581,7 @@ public partial class MainViewModel : ObservableObject
 
                 _auditLogger.Log("Info", "Faces", $"Удален профиль: {person.Name}");
                 RefreshFaceStats();
+                await LoadUnassignedFacesAsync();
             }
         }
     }
