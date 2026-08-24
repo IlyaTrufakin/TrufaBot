@@ -28,8 +28,8 @@ public class ThumbnailService : IThumbnailService
         var ext = fileInfo.Extension.ToLowerInvariant();
         var isVideo = VideoExtensions.Contains(ext);
 
-        // Версия кэша v4 для генерации реальных кадров видео с кнопкой Play
-        var thumbFileName = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}_{width}x{height}_v4.jpg";
+        // Версия кэша v5: мгновенный захват реального кадра видео без зависания pipe
+        var thumbFileName = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}_{width}x{height}_v5.jpg";
         var thumbPath = Path.Combine(AppPaths.CacheFolder, thumbFileName);
 
         if (File.Exists(thumbPath))
@@ -176,33 +176,23 @@ public class ThumbnailService : IThumbnailService
 
         try
         {
-            // Берем кадр на 1.0 секунде (чтобы пропустить черные вступительные кадры)
-            var psi = new ProcessStartInfo
-            {
-                FileName = ffmpeg,
-                Arguments = $"-ss 00:00:01 -i \"{originalPath}\" -vframes 1 -q:v 2 \"{tempFrame}\" -y",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true
-            };
+            // 1. Захватываем кадр на 1.0 секунде (минуя черный вступительный кадр)
+            bool ok = RunFfmpegFrameExtract(ffmpeg, originalPath, "00:00:01", tempFrame);
 
-            using (var proc = Process.Start(psi))
+            // 2. Если видео очень короткое (< 1 сек), пробуем кадр на 0.1 сек
+            if (!ok || !File.Exists(tempFrame) || new FileInfo(tempFrame).Length == 0)
             {
-                if (proc != null)
-                {
-                    proc.WaitForExit(5000);
-                }
+                ok = RunFfmpegFrameExtract(ffmpeg, originalPath, "00:00:00.1", tempFrame);
             }
 
-            if (File.Exists(tempFrame))
+            if (File.Exists(tempFrame) && new FileInfo(tempFrame).Length > 0)
             {
-                return SKBitmap.Decode(tempFrame);
+                using var stream = File.OpenRead(tempFrame);
+                return SKBitmap.Decode(stream);
             }
         }
         catch
         {
-            // Игнорируем ошибки вызова процесса
         }
         finally
         {
@@ -216,37 +206,44 @@ public class ThumbnailService : IThumbnailService
         return null;
     }
 
-    private static string? GetFfmpegPath()
+    private static bool RunFfmpegFrameExtract(string ffmpeg, string videoPath, string timeOffset, string outputPath)
     {
-        if (_ffmpegChecked) return _cachedFfmpegPath;
-
-        // 1. Проверяем PATH
         try
         {
             var psi = new ProcessStartInfo
             {
-                FileName = "ffmpeg",
-                Arguments = "-version",
+                FileName = ffmpeg,
+                Arguments = $"-nostdin -hide_banner -loglevel error -ss {timeOffset} -i \"{videoPath}\" -vframes 1 -q:v 2 \"{outputPath}\" -y",
                 CreateNoWindow = true,
-                UseShellExecute = false
+                UseShellExecute = false,
+                RedirectStandardError = false,
+                RedirectStandardOutput = false
             };
+
             using var proc = Process.Start(psi);
-            proc?.WaitForExit(1000);
-            if (proc?.ExitCode == 0)
+            if (proc != null)
             {
-                _cachedFfmpegPath = "ffmpeg";
-                _ffmpegChecked = true;
-                return _cachedFfmpegPath;
+                proc.WaitForExit(5000);
+                return proc.ExitCode == 0 && File.Exists(outputPath);
             }
         }
-        catch { }
+        catch
+        {
+        }
+        return false;
+    }
 
-        // 2. Проверяем стандартные пути WinGet и системы
+    private static string? GetFfmpegPath()
+    {
+        if (_ffmpegChecked) return _cachedFfmpegPath;
+
+        // 1. Проверяем стандартные прямые пути к ffmpeg.exe на Windows
         var candidates = new[]
         {
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WinGet\Links\ffmpeg.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"ffmpeg\bin\ffmpeg.exe"),
-            @"C:\ffmpeg\bin\ffmpeg.exe"
+            @"C:\ffmpeg\bin\ffmpeg.exe",
+            @"C:\ffmpeg\ffmpeg.exe"
         };
 
         foreach (var path in candidates)
@@ -258,6 +255,29 @@ public class ThumbnailService : IThumbnailService
                 return _cachedFfmpegPath;
             }
         }
+
+        // 2. Проверяем глобальный PATH
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = "-version",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardError = false,
+                RedirectStandardOutput = false
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(1000);
+            if (proc?.ExitCode == 0)
+            {
+                _cachedFfmpegPath = "ffmpeg";
+                _ffmpegChecked = true;
+                return _cachedFfmpegPath;
+            }
+        }
+        catch { }
 
         _ffmpegChecked = true;
         return null;
