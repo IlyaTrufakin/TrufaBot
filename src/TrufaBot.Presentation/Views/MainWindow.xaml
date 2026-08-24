@@ -541,17 +541,30 @@
                                     </StackPanel>
 
                                     <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                        <Button Content="▶ Сканировать новые фото" Command="{Binding StartFaceIndexingCommand}" 
+                                                Padding="12,6" Margin="0,0,8,0" Background="#A6E3A1" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Сканирует только новые фото. Существующие привязки людей НЕ сбрасываются."/>
+                                        <Button Content="⏹ Стоп" Command="{Binding StopFaceIndexingCommand}" 
+                                                Padding="10,6" Margin="0,0,8,0" Background="#585B70" Foreground="#FFFFFF" FontWeight="Bold"
+                                                ToolTip="Приостановить процесс сканирования"/>
                                         <Button Content="🔄 Сбросить привязки" Command="{Binding ResetAllFaceAssignmentsCommand}" 
-                                                Padding="10,6" Margin="0,0,8,0" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" ToolTip="Отвязать все ошибочно сопоставленные фото"/>
-                                        <Button Content="🧹 Очистить и сканировать заново" Command="{Binding ClearAndRescanFacesCommand}" 
-                                                Padding="10,6" Margin="0,0,8,0" Background="#F9E2AF" Foreground="#11111B" FontWeight="Bold" ToolTip="Удалить старые сканы (включая растения) и найти только людей"/>
-                                        <Button Content="⏹" Command="{Binding StopFaceIndexingCommand}" 
-                                                Padding="10,6" Background="#585B70" Foreground="#FFFFFF" FontWeight="Bold"/>
+                                                Padding="10,6" Margin="0,0,8,0" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Отвязать все фото от людей (вернуть в неразмеченные)"/>
+                                        <Button Content="🧹 Полная пересканировка" Command="{Binding ClearAndRescanFacesCommand}" 
+                                                Padding="10,6" Background="#F9E2AF" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Очистить старую базу со следами природы и пересканировать всё нейросетью UltraFace с нуля"/>
                                     </StackPanel>
                                 </Grid>
 
-                                <ProgressBar Grid.Row="1" Height="6" Value="{Binding FaceIndexingProgress}" Maximum="100" 
-                                             Background="#11111B" Foreground="#89B4FA"/>
+                                <Grid Grid.Row="1">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="6"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <ProgressBar Grid.Row="0" Height="6" Value="{Binding FaceIndexingProgress}" Maximum="100" 
+                                                 Background="#11111B" Foreground="#89B4FA" Margin="0,0,0,6"/>
+                                    <TextBlock Grid.Row="1" Text="{Binding FaceIndexingStatusText}" Foreground="#CDD6F4" FontSize="11"/>
+                                </Grid>
                             </Grid>
                         </Border>
 

@@ -1,4 +1,7 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Security.Cryptography;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 using SkiaSharp;
 using TrufaBot.Application.Interfaces;
 using TrufaBot.Domain.Entities;
@@ -11,10 +14,59 @@ public class FaceRecognitionService : IFaceRecognitionService
 {
     private const int EmbeddingSize = 128;
     private static readonly string FaceCacheDir = Path.Combine(AppPaths.CacheFolder, "faces");
+    private static readonly string ModelDir = Path.Combine(AppPaths.AppDataFolder, "models");
+    private static readonly string ModelPath = Path.Combine(ModelDir, "version-RFB-320.onnx");
+    private static readonly string ModelUrl = "https://raw.githubusercontent.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/master/models/onnx/version-RFB-320.onnx";
+
+    private InferenceSession? _session;
+    private readonly object _sessionLock = new();
 
     public FaceRecognitionService()
     {
         Directory.CreateDirectory(FaceCacheDir);
+        Directory.CreateDirectory(ModelDir);
+        EnsureModelDownloaded();
+        InitializeSession();
+    }
+
+    private void EnsureModelDownloaded()
+    {
+        if (File.Exists(ModelPath) && new FileInfo(ModelPath).Length > 500000) return;
+
+        try
+        {
+            using var client = new System.Net.Http.HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(30);
+            var bytes = client.GetByteArrayAsync(ModelUrl).GetAwaiter().GetResult();
+            if (bytes != null && bytes.Length > 500000)
+            {
+                File.WriteAllBytes(ModelPath, bytes);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void InitializeSession()
+    {
+        lock (_sessionLock)
+        {
+            if (_session != null) return;
+            if (File.Exists(ModelPath))
+            {
+                try
+                {
+                    var options = new SessionOptions();
+                    options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+                    _session = new InferenceSession(ModelPath, options);
+                }
+                catch
+                {
+                    _session = null;
+                }
+            }
+        }
     }
 
     public async Task<List<DetectedFaceResult>> DetectAndRecognizeFacesAsync(string imagePath, CancellationToken ct = default)
@@ -29,9 +81,9 @@ public class FaceRecognitionService : IFaceRecognitionService
             if (codec == null) return results;
 
             using var bitmap = SKBitmap.Decode(codec);
-            if (bitmap == null || bitmap.Width < 80 || bitmap.Height < 80) return results;
+            if (bitmap == null || bitmap.Width < 40 || bitmap.Height < 40) return results;
 
-            var detectedFaces = FindRealHumanFaces(bitmap);
+            var detectedFaces = await Task.Run(() => RunUltraFaceDetection(bitmap), ct);
             if (!detectedFaces.Any()) return results;
 
             using var db = new AppDbContext();
@@ -74,6 +126,148 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
 
         return results;
+    }
+
+    private List<DetectedFaceResult> RunUltraFaceDetection(SKBitmap originalBitmap)
+    {
+        var list = new List<DetectedFaceResult>();
+
+        lock (_sessionLock)
+        {
+            if (_session == null)
+            {
+                InitializeSession();
+                if (_session == null) return list; // Без нейросети не создаем ложные детекции
+            }
+
+            const int inputW = 320;
+            const int inputH = 240;
+
+            using var resized = originalBitmap.Resize(new SKImageInfo(inputW, inputH, SKColorType.Rgb888x), SKFilterQuality.Medium);
+            if (resized == null) return list;
+
+            var inputTensor = new DenseTensor<float>(new[] { 1, 3, inputH, inputW });
+            var pixels = resized.Pixels;
+
+            for (int y = 0; y < inputH; y++)
+            {
+                for (int x = 0; x < inputW; x++)
+                {
+                    var pixel = pixels[y * inputW + x];
+                    // Нормализация UltraFace: (val - 127.0) / 128.0
+                    inputTensor[0, 0, y, x] = (pixel.Red - 127.0f) / 128.0f;
+                    inputTensor[0, 1, y, x] = (pixel.Green - 127.0f) / 128.0f;
+                    inputTensor[0, 2, y, x] = (pixel.Blue - 127.0f) / 128.0f;
+                }
+            }
+
+            var inputs = new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor("input", inputTensor)
+            };
+
+            using var outputs = _session.Run(inputs);
+            var scoresTensor = outputs.FirstOrDefault(o => o.Name.Contains("scores"))?.AsTensor<float>();
+            var boxesTensor = outputs.FirstOrDefault(o => o.Name.Contains("boxes"))?.AsTensor<float>();
+
+            if (scoresTensor == null || boxesTensor == null) return list;
+
+            int numBoxes = scoresTensor.Dimensions[1];
+            var candidateBoxes = new List<(float X1, float Y1, float X2, float Y2, float Score)>();
+
+            for (int i = 0; i < numBoxes; i++)
+            {
+                float score = scoresTensor[0, i, 1]; // Вероятность лица
+                if (score > 0.70f) // Высокий порог уверенности нейросети
+                {
+                    float x1 = Math.Clamp(boxesTensor[0, i, 0], 0f, 1f);
+                    float y1 = Math.Clamp(boxesTensor[0, i, 1], 0f, 1f);
+                    float x2 = Math.Clamp(boxesTensor[0, i, 2], 0f, 1f);
+                    float y2 = Math.Clamp(boxesTensor[0, i, 3], 0f, 1f);
+
+                    float w = x2 - x1;
+                    float h = y2 - y1;
+
+                    if (w > 0.04f && h > 0.04f)
+                    {
+                        candidateBoxes.Add((x1, y1, x2, y2, score));
+                    }
+                }
+            }
+
+            // Non-Maximum Suppression (NMS) для удаления дубликатов одного лица
+            var finalBoxes = ApplyNMS(candidateBoxes, 0.40f);
+
+            int origW = originalBitmap.Width;
+            int origH = originalBitmap.Height;
+
+            foreach (var b in finalBoxes)
+            {
+                float bw = b.X2 - b.X1;
+                float bh = b.Y2 - b.Y1;
+
+                int cropX = Math.Max(0, (int)(b.X1 * origW));
+                int cropY = Math.Max(0, (int)(b.Y1 * origH));
+                int cropW = Math.Min(origW - cropX, (int)(bw * origW));
+                int cropH = Math.Min(origH - cropY, (int)(bh * origH));
+
+                if (cropW < 20 || cropH < 20) continue;
+
+                var rect = new SKRectI(cropX, cropY, cropX + cropW, cropY + cropH);
+                using var faceBitmap = new SKBitmap();
+                if (originalBitmap.ExtractSubset(faceBitmap, rect))
+                {
+                    var embedding = ComputeNormalizedFeatureVector(faceBitmap, EmbeddingSize);
+                    list.Add(new DetectedFaceResult
+                    {
+                        BoxX = b.X1,
+                        BoxY = b.Y1,
+                        BoxWidth = bw,
+                        BoxHeight = bh,
+                        Confidence = b.Score,
+                        Embedding = embedding
+                    });
+                }
+            }
+        }
+
+        return list;
+    }
+
+    private List<(float X1, float Y1, float X2, float Y2, float Score)> ApplyNMS(List<(float X1, float Y1, float X2, float Y2, float Score)> boxes, float iouThreshold)
+    {
+        var sorted = boxes.OrderByDescending(b => b.Score).ToList();
+        var selected = new List<(float X1, float Y1, float X2, float Y2, float Score)>();
+
+        while (sorted.Count > 0)
+        {
+            var best = sorted[0];
+            selected.Add(best);
+            sorted.RemoveAt(0);
+
+            sorted.RemoveAll(box => CalculateIoU(best, box) > iouThreshold);
+        }
+
+        return selected;
+    }
+
+    private float CalculateIoU((float X1, float Y1, float X2, float Y2, float Score) a, (float X1, float Y1, float X2, float Y2, float Score) b)
+    {
+        float interX1 = Math.Max(a.X1, b.X1);
+        float interY1 = Math.Max(a.Y1, b.Y1);
+        float interX2 = Math.Min(a.X2, b.X2);
+        float interY2 = Math.Min(a.Y2, b.Y2);
+
+        float interW = Math.Max(0, interX2 - interX1);
+        float interH = Math.Max(0, interY2 - interY1);
+        float interArea = interW * interH;
+
+        float areaA = (a.X2 - a.X1) * (a.Y2 - a.Y1);
+        float areaB = (b.X2 - b.X1) * (b.Y2 - b.Y1);
+        float unionArea = areaA + areaB - interArea;
+
+        if (unionArea <= 0) return 0;
+        return interArea / unionArea;
     }
 
     public async Task<string> GetOrCreateFaceCropThumbnailAsync(string originalImagePath, float boxX, float boxY, float boxW, float boxH, long faceId, CancellationToken ct = default)
@@ -231,117 +425,6 @@ public class FaceRecognitionService : IFaceRecognitionService
         {
             return null;
         }
-    }
-
-    private List<DetectedFaceResult> FindRealHumanFaces(SKBitmap original)
-    {
-        var list = new List<DetectedFaceResult>();
-        int w = original.Width;
-        int h = original.Height;
-
-        var candidateZones = new[]
-        {
-            new { X = 0.20f, Y = 0.10f, W = 0.60f, H = 0.65f },
-            new { X = 0.08f, Y = 0.15f, W = 0.45f, H = 0.55f },
-            new { X = 0.47f, Y = 0.15f, W = 0.45f, H = 0.55f },
-            new { X = 0.28f, Y = 0.05f, W = 0.44f, H = 0.45f }
-        };
-
-        foreach (var zone in candidateZones)
-        {
-            int cropX = (int)(zone.X * w);
-            int cropY = (int)(zone.Y * h);
-            int cropW = (int)(zone.W * w);
-            int cropH = (int)(zone.H * h);
-
-            if (cropW < 60 || cropH < 60) continue;
-
-            var subset = new SKRectI(cropX, cropY, cropX + cropW, cropY + cropH);
-            using var cropBitmap = new SKBitmap();
-            if (!original.ExtractSubset(cropBitmap, subset)) continue;
-
-            if (!ValidateHumanSkinTone(cropBitmap, out float skinRatio)) continue;
-            if (!ValidateFacialLuminanceStructure(cropBitmap)) continue;
-
-            var embedding = ComputeNormalizedFeatureVector(cropBitmap, EmbeddingSize);
-
-            list.Add(new DetectedFaceResult
-            {
-                BoxX = zone.X,
-                BoxY = zone.Y,
-                BoxWidth = zone.W,
-                BoxHeight = zone.H,
-                Confidence = skinRatio,
-                Embedding = embedding
-            });
-
-            if (skinRatio > 0.65f) break;
-        }
-
-        return list;
-    }
-
-    private bool ValidateHumanSkinTone(SKBitmap bitmap, out float skinRatio)
-    {
-        skinRatio = 0f;
-        int totalPixels = 0;
-        int skinPixels = 0;
-        int greenPixels = 0;
-
-        using var small = bitmap.Resize(new SKImageInfo(64, 64, SKColorType.Rgba8888), SKFilterQuality.Low);
-        if (small == null) return false;
-
-        var pixels = small.Pixels;
-        foreach (var p in pixels)
-        {
-            byte r = p.Red;
-            byte g = p.Green;
-            byte b = p.Blue;
-            totalPixels++;
-
-            if (g > r && g > b)
-            {
-                greenPixels++;
-            }
-
-            if (r > 95 && g > 40 && b > 20 &&
-                (Math.Max(r, Math.Max(g, b)) - Math.Min(r, Math.Min(g, b))) > 15 &&
-                Math.Abs(r - g) > 15 && r > g && r > b)
-            {
-                double cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-                double cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-
-                if (cb >= 77 && cb <= 130 && cr >= 133 && cr <= 175)
-                {
-                    skinPixels++;
-                }
-            }
-        }
-
-        if (totalPixels == 0) return false;
-        if ((float)greenPixels / totalPixels > 0.20f) return false;
-
-        skinRatio = (float)skinPixels / totalPixels;
-        return skinRatio >= 0.25f && skinRatio <= 0.85f;
-    }
-
-    private bool ValidateFacialLuminanceStructure(SKBitmap bitmap)
-    {
-        using var small = bitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Low);
-        if (small == null) return false;
-
-        var bytes = small.GetPixelSpan();
-        if (bytes.Length < 1024) return false;
-
-        float topLuma = 0;
-        for (int i = 0; i < 32 * 10; i++) topLuma += bytes[i];
-        topLuma /= (32 * 10);
-
-        float midLuma = 0;
-        for (int i = 32 * 10; i < 32 * 22; i++) midLuma += bytes[i];
-        midLuma /= (32 * 12);
-
-        return Math.Abs(midLuma - topLuma) > 4;
     }
 
     private float[] ComputeNormalizedFeatureVector(SKBitmap faceBitmap, int vectorLength)

@@ -50,34 +50,55 @@ public class FaceIndexingService
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
 
-        _logger.Log("Info", "Faces", "Запущен процесс поиска и распознавания лиц на фотографиях.");
+        _logger.Log("Info", "Faces", "Запущен процесс поиска лиц нейросетью UltraFace.");
 
         try
         {
             using var db = new AppDbContext();
+            
+            // Находим ID файлов, которые УЖЕ были отсканированы на лица
+            var scannedMediaIds = await db.PersonFaces
+                .Select(f => f.MediaItemId)
+                .Distinct()
+                .ToListAsync(ct);
+
+            var scannedSet = new HashSet<long>(scannedMediaIds);
+
             var items = await db.MediaItems
                 .Include(m => m.StorageSource)
-                .Include(m => m.Faces)
                 .Where(m => !m.IsDeleted && m.StorageSource.IsEnabled)
                 .OrderBy(m => m.Id)
                 .ToListAsync(ct);
 
-            var photoItems = items
-                .Where(m => SupportedImageExtensions.Contains(m.FileExtension))
+            // Обрабатываем ТОЛЬКО новые / несканированные фотографии, чтобы НЕ затирать существующие привязки
+            var unindexedPhotoItems = items
+                .Where(m => SupportedImageExtensions.Contains(m.FileExtension) && !scannedSet.Contains(m.Id))
                 .ToList();
 
-            int total = photoItems.Count;
+            int total = unindexedPhotoItems.Count;
             int processed = 0;
             int totalFacesFound = 0;
+
+            if (total == 0)
+            {
+                ProgressChanged?.Invoke(this, new FaceIndexingProgressEventArgs
+                {
+                    TotalCount = 0,
+                    ProcessedCount = 0,
+                    StatusMessage = "Все фотографии в архиве уже просканированы нейросетью!",
+                    IsCompleted = true
+                });
+                return;
+            }
 
             ProgressChanged?.Invoke(this, new FaceIndexingProgressEventArgs
             {
                 TotalCount = total,
                 ProcessedCount = 0,
-                StatusMessage = $"Сканирование лиц на {total} фотографиях..."
+                StatusMessage = $"Нейросеть сканирует {total} новых фотографий..."
             });
 
-            foreach (var item in photoItems)
+            foreach (var item in unindexedPhotoItems)
             {
                 if (ct.IsCancellationRequested) break;
 
@@ -89,7 +110,7 @@ public class FaceIndexingService
                         TotalCount = total,
                         ProcessedCount = processed,
                         CurrentFile = item.FileName,
-                        StatusMessage = $"Поиск лиц ({processed + 1}/{total}): {item.FileName}"
+                        StatusMessage = $"Сканирование ({processed + 1}/{total}): {item.FileName}"
                     });
 
                     var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 800, 800);
@@ -97,10 +118,6 @@ public class FaceIndexingService
 
                     if (detected.Any())
                     {
-                        // Удаляем старые лица для этого элемента и добавляем новые
-                        var existingFaces = db.PersonFaces.Where(f => f.MediaItemId == item.Id);
-                        db.PersonFaces.RemoveRange(existingFaces);
-
                         foreach (var d in detected)
                         {
                             var face = new PersonFace
@@ -128,7 +145,7 @@ public class FaceIndexingService
                     TotalCount = total,
                     ProcessedCount = processed,
                     CurrentFile = item.FileName,
-                    StatusMessage = $"Обработано {processed} из {total} (найдено {totalFacesFound} лиц)"
+                    StatusMessage = $"Обработано {processed} из {total} (найдено {totalFacesFound} лиц людей)"
                 });
             }
 
@@ -136,15 +153,15 @@ public class FaceIndexingService
             {
                 TotalCount = total,
                 ProcessedCount = processed,
-                StatusMessage = $"Распознавание лиц завершено! Найдено {totalFacesFound} лиц.",
+                StatusMessage = $"Сканирование завершено! Найдено {totalFacesFound} лиц людей.",
                 IsCompleted = true
             });
 
-            _logger.Log("Info", "Faces", $"Распознавание лиц завершено. Обработано {processed} фото, найдено {totalFacesFound} лиц.");
+            _logger.Log("Info", "Faces", $"Сканирование завершено. Обработано {processed} новых фото, обнаружено {totalFacesFound} лиц людей.");
         }
         catch (OperationCanceledException)
         {
-            _logger.Log("Info", "Faces", "Распознавание лиц остановлено пользователем.");
+            _logger.Log("Info", "Faces", "Сканирование лиц приостановлено пользователем.");
         }
         catch (Exception ex)
         {
