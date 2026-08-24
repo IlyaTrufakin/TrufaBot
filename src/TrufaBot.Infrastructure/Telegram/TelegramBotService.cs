@@ -217,10 +217,16 @@ public class TelegramBotService
     private async Task SendPeopleMenuAsync(ITelegramBotClient bot, long chatId, int? editMessageId, Domain.Entities.User user, AppDbContext db, CancellationToken ct)
     {
         var people = await db.People
-            .Include(p => p.Faces)
             .OrderBy(p => p.Category)
             .ThenBy(p => p.Name)
             .ToListAsync(ct);
+
+        // Подсчет уникальных фотографий
+        var distinctCounts = await db.PersonFaces
+            .Where(f => f.PersonId != null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+            .GroupBy(f => f.PersonId!.Value)
+            .Select(g => new { PersonId = g.Key, Count = g.Select(x => x.MediaItemId).Distinct().Count() })
+            .ToDictionaryAsync(x => x.PersonId, x => x.Count, ct);
 
         var buttons = new List<InlineKeyboardButton[]>();
 
@@ -241,10 +247,12 @@ public class TelegramBotService
                 for (int i = 0; i < catPeople.Count; i += 2)
                 {
                     var row = new List<InlineKeyboardButton>();
-                    row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i].Name} ({catPeople[i].Faces.Count})", $"view_person_{catPeople[i].Id}"));
+                    int count1 = distinctCounts.GetValueOrDefault(catPeople[i].Id, 0);
+                    row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i].Name} ({count1})", $"view_person_{catPeople[i].Id}"));
                     if (i + 1 < catPeople.Count)
                     {
-                        row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i + 1].Name} ({catPeople[i + 1].Faces.Count})", $"view_person_{catPeople[i + 1].Id}"));
+                        int count2 = distinctCounts.GetValueOrDefault(catPeople[i + 1].Id, 0);
+                        row.Add(InlineKeyboardButton.WithCallbackData($"{cat.Icon} {catPeople[i + 1].Name} ({count2})", $"view_person_{catPeople[i + 1].Id}"));
                     }
                     buttons.Add(row.ToArray());
                 }
@@ -259,10 +267,12 @@ public class TelegramBotService
             for (int i = 0; i < otherPeople.Count; i += 2)
             {
                 var row = new List<InlineKeyboardButton>();
-                row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i].Name} ({otherPeople[i].Faces.Count})", $"view_person_{otherPeople[i].Id}"));
+                int count1 = distinctCounts.GetValueOrDefault(otherPeople[i].Id, 0);
+                row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i].Name} ({count1})", $"view_person_{otherPeople[i].Id}"));
                 if (i + 1 < otherPeople.Count)
                 {
-                    row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i + 1].Name} ({otherPeople[i + 1].Faces.Count})", $"view_person_{otherPeople[i + 1].Id}"));
+                    int count2 = distinctCounts.GetValueOrDefault(otherPeople[i + 1].Id, 0);
+                    row.Add(InlineKeyboardButton.WithCallbackData($"👤 {otherPeople[i + 1].Name} ({count2})", $"view_person_{otherPeople[i + 1].Id}"));
                 }
                 buttons.Add(row.ToArray());
             }

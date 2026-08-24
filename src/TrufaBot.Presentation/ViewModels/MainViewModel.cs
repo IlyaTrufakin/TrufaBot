@@ -1,5 +1,4 @@
-﻿using TrufaBot.Infrastructure.Storage;
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.IO;
 using System.Text.Json;
 using System.Windows;
@@ -12,6 +11,7 @@ using TrufaBot.Infrastructure.Common;
 using TrufaBot.Infrastructure.Data;
 using TrufaBot.Infrastructure.Logging;
 using TrufaBot.Infrastructure.Services;
+using TrufaBot.Infrastructure.Storage;
 using TrufaBot.Infrastructure.Telegram;
 
 namespace TrufaBot.Presentation.ViewModels;
@@ -25,6 +25,25 @@ public class AppConfigModel
     public bool AutoAiIndexing { get; set; } = false;
 }
 
+public partial class PersonItemViewModel : ObservableObject
+{
+    public int Id { get; set; }
+
+    [ObservableProperty]
+    private string _name = string.Empty;
+
+    [ObservableProperty]
+    private string _category = "Семья";
+
+    [ObservableProperty]
+    private string? _notes;
+
+    [ObservableProperty]
+    private int _photosCount;
+
+    public DateTime CreatedAt { get; set; }
+}
+
 public partial class UnassignedFaceItemViewModel : ObservableObject
 {
     public long FaceId { get; set; }
@@ -34,7 +53,7 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
     public string CropThumbnailPath { get; set; } = "";
 
     [ObservableProperty]
-    private Person? _selectedPerson;
+    private PersonItemViewModel? _selectedPerson;
 }
 
 public partial class PersonPhotoItemViewModel : ObservableObject
@@ -153,10 +172,10 @@ public partial class MainViewModel : ObservableObject
 
     // --- ЧЛЕНЫ СЕМЬИ И ЛИЦА (FACE RECOGNITION) ---
     [ObservableProperty]
-    private ObservableCollection<Person> _people = new();
+    private ObservableCollection<PersonItemViewModel> _people = new();
 
     [ObservableProperty]
-    private Person? _selectedPerson;
+    private PersonItemViewModel? _selectedPerson;
 
     [ObservableProperty]
     private string _newPersonName = "";
@@ -276,7 +295,7 @@ public partial class MainViewModel : ObservableObject
         UpdateAvailableFoldersForSelectedSource();
     }
 
-    partial void OnSelectedPersonChanged(Person? value)
+    partial void OnSelectedPersonChanged(PersonItemViewModel? value)
     {
         LoadPhotosForSelectedPerson(value);
     }
@@ -354,12 +373,6 @@ public partial class MainViewModel : ObservableObject
             Users.Add(u);
         }
 
-        People.Clear();
-        foreach (var p in db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToList())
-        {
-            People.Add(p);
-        }
-
         if (SelectedUser == null && Users.Any())
         {
             SelectedUser = Users.First();
@@ -368,11 +381,6 @@ public partial class MainViewModel : ObservableObject
         if (SelectedPermissionSource == null && Sources.Any())
         {
             SelectedPermissionSource = Sources.First();
-        }
-
-        if (SelectedPerson == null && People.Any())
-        {
-            SelectedPerson = People.First();
         }
     }
 
@@ -419,14 +427,20 @@ public partial class MainViewModel : ObservableObject
             {
                 using var db = new AppDbContext();
                 var totalFaces = await db.PersonFaces.CountAsync(f => !f.IsIgnored);
-                var peopleList = await db.People.Include(p => p.Faces).OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
+                var peopleList = await db.People.OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
+
+                // Считаем уникальные фотографии для каждого человека
+                var distinctCounts = await db.PersonFaces
+                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .GroupBy(f => f.PersonId!.Value)
+                    .Select(g => new { PersonId = g.Key, Count = g.Select(x => x.MediaItemId).Distinct().Count() })
+                    .ToDictionaryAsync(x => x.PersonId, x => x.Count);
 
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     TotalKnownFacesCount = totalFaces;
                     var currentSelectedId = SelectedPerson?.Id;
 
-                    // Обновляем список людей без полного Clear, чтобы не сбрасывать выбранного человека
                     var dict = peopleList.ToDictionary(p => p.Id);
 
                     for (int i = People.Count - 1; i >= 0; i--)
@@ -440,31 +454,31 @@ public partial class MainViewModel : ObservableObject
                     for (int i = 0; i < peopleList.Count; i++)
                     {
                         var fresh = peopleList[i];
-                        if (i < People.Count && People[i].Id == fresh.Id)
+                        int count = distinctCounts.GetValueOrDefault(fresh.Id, 0);
+
+                        var existing = People.FirstOrDefault(x => x.Id == fresh.Id);
+                        if (existing != null)
                         {
-                            People[i].Name = fresh.Name;
-                            People[i].Category = fresh.Category;
-                            People[i].Notes = fresh.Notes;
-                            People[i].Faces = fresh.Faces;
+                            existing.Name = fresh.Name;
+                            existing.Category = fresh.Category;
+                            existing.Notes = fresh.Notes;
+                            existing.PhotosCount = count;
                         }
                         else
                         {
-                            var existing = People.FirstOrDefault(x => x.Id == fresh.Id);
-                            if (existing != null)
+                            var vm = new PersonItemViewModel
                             {
-                                existing.Name = fresh.Name;
-                                existing.Category = fresh.Category;
-                                existing.Notes = fresh.Notes;
-                                existing.Faces = fresh.Faces;
-                            }
-                            else
-                            {
-                                People.Insert(i, fresh);
-                            }
+                                Id = fresh.Id,
+                                Name = fresh.Name,
+                                Category = fresh.Category,
+                                Notes = fresh.Notes,
+                                PhotosCount = count,
+                                CreatedAt = fresh.CreatedAt
+                            };
+                            People.Insert(i, vm);
                         }
                     }
 
-                    // Сохраняем и восстанавливаем выбор
                     if (currentSelectedId.HasValue)
                     {
                         var matched = People.FirstOrDefault(x => x.Id == currentSelectedId.Value);
@@ -530,7 +544,7 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private void LoadPhotosForSelectedPerson(Person? person)
+    private void LoadPhotosForSelectedPerson(PersonItemViewModel? person)
     {
         if (person == null)
         {
@@ -579,6 +593,7 @@ public partial class MainViewModel : ObservableObject
                     {
                         SelectedPersonPhotos.Add(vm);
                     }
+                    person.PhotosCount = SelectedPersonPhotos.Count;
                 });
             }
             catch { }
@@ -659,10 +674,16 @@ public partial class MainViewModel : ObservableObject
 
             _auditLogger.Log("Info", "Faces", $"Фото '{photoItem.FileName}' успешно отвязано от '{personName}'.");
 
-            // Удаляем только эту карточку из видимой галереи мгновенно
+            // Мгновенно убираем фото из галереи
             SelectedPersonPhotos.Remove(photoItem);
 
-            // Обновляем счетчики в фоне без сброса выбора человека
+            // Мгновенно уменьшаем реактивный счетчик у человека в таблице
+            if (SelectedPerson.PhotosCount > 0)
+            {
+                SelectedPerson.PhotosCount--;
+            }
+
+            // Обновляем статистику в фоне
             RefreshFaceStats();
             await LoadUnassignedFacesAsync();
         }
@@ -734,7 +755,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task DeletePersonAsync(Person? person)
+    private async Task DeletePersonAsync(PersonItemViewModel? person)
     {
         if (person == null) return;
 

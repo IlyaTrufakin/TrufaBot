@@ -488,7 +488,7 @@
                                     <DataGrid.Columns>
                                         <DataGridTextColumn Header="Имя" Binding="{Binding Name}" Width="105"/>
                                         <DataGridTextColumn Header="Группа" Binding="{Binding Category}" Width="90"/>
-                                        <DataGridTextColumn Header="Фото" Binding="{Binding Faces.Count}" Width="50"/>
+                                        <DataGridTextColumn Header="Фото" Binding="{Binding PhotosCount}" Width="50"/>
                                         <DataGridTextColumn Header="Заметка" Binding="{Binding Notes}" Width="*"/>
                                         <DataGridTemplateColumn Header="Удал." Width="45">
                                             <DataGridTemplateColumn.CellTemplate>
