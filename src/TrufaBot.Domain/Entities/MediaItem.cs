@@ -33,4 +33,5 @@ public class MediaItem
     public DateTime? AIProcessedAt { get; set; }
 
     public ICollection<MediaClassification> Classifications { get; set; } = new List<MediaClassification>();
+    public ICollection<PersonFace> Faces { get; set; } = new List<PersonFace>();
 }

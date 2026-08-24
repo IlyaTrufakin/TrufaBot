@@ -23,6 +23,7 @@ public class AiIndexingService
     };
 
     private readonly IAiVisionService _aiVisionService;
+    private readonly IFaceRecognitionService _faceService;
     private readonly IThumbnailService _thumbnailService;
     private readonly IAuditLogger _logger;
     private CancellationTokenSource? _cts;
@@ -30,9 +31,14 @@ public class AiIndexingService
     public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
     public event EventHandler<AiIndexingProgressEventArgs>? ProgressChanged;
 
-    public AiIndexingService(IAiVisionService aiVisionService, IThumbnailService thumbnailService, IAuditLogger logger)
+    public AiIndexingService(
+        IAiVisionService aiVisionService, 
+        IFaceRecognitionService faceService,
+        IThumbnailService thumbnailService, 
+        IAuditLogger logger)
     {
         _aiVisionService = aiVisionService;
+        _faceService = faceService;
         _thumbnailService = thumbnailService;
         _logger = logger;
     }
@@ -50,15 +56,16 @@ public class AiIndexingService
         _cts = new CancellationTokenSource();
         var ct = _cts.Token;
 
-        _logger.Log("Info", "AI", "Запущен фоновый процесс индексации фотографий ИИ.");
+        _logger.Log("Info", "AI", "Запущен фоновый процесс индексации фотографий ИИ с распознаванием лиц.");
 
         try
         {
             using var db = new AppDbContext();
             
-            // Получаем список медиафайлов, которые еще не обработаны
             var pendingItems = await db.MediaItems
                 .Include(m => m.StorageSource)
+                .Include(m => m.Faces)
+                .ThenInclude(f => f.Person)
                 .Where(m => !m.IsDeleted && m.StorageSource.IsEnabled && (string.IsNullOrEmpty(m.AIDescription) || m.ClassificationStatus == ClassificationStatus.Pending))
                 .OrderBy(m => m.Id)
                 .ToListAsync(ct);
@@ -74,7 +81,7 @@ public class AiIndexingService
             {
                 TotalCount = total,
                 ProcessedCount = 0,
-                StatusMessage = $"Начало обработки {total} фотографий..."
+                StatusMessage = $"Начало анализа {total} фотографий..."
             });
 
             foreach (var item in photoItems)
@@ -95,7 +102,23 @@ public class AiIndexingService
                     // Создаем оптимизированную миниатюру 600x600 для быстрой передачи в ИИ
                     var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 600, 600);
                     
+                    // 1. Распознаем лица на фото
+                    var detectedFaces = await _faceService.DetectAndRecognizeFacesAsync(thumbPath, ct);
+                    var recognizedPersonNames = detectedFaces
+                        .Where(f => !string.IsNullOrEmpty(f.MatchedPersonName))
+                        .Select(f => f.MatchedPersonName!)
+                        .Distinct()
+                        .ToList();
+
+                    // 2. Отправляем в Qwen2.5-VL / LM Studio с контекстом распознанных лиц!
                     var (description, tags) = await _aiVisionService.AnalyzePhotoAsync(thumbPath, serverUrl, modelName, ct);
+
+                    // Если распознаны конкретные люди, обогащаем теги и описание
+                    if (recognizedPersonNames.Any())
+                    {
+                        var peopleTags = string.Join(", ", recognizedPersonNames);
+                        tags = string.IsNullOrEmpty(tags) ? peopleTags : $"{peopleTags}, {tags}";
+                    }
 
                     if (!string.IsNullOrEmpty(description) || !string.IsNullOrEmpty(tags))
                     {

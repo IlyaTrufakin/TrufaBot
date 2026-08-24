@@ -30,6 +30,8 @@ public partial class MainViewModel : ObservableObject
     private readonly TelegramBotService _botService;
     private readonly IStorageSyncService _syncService;
     private readonly IAiVisionService _aiVisionService;
+    private readonly IFaceRecognitionService _faceService;
+    private readonly FaceIndexingService _faceIndexingService;
     private readonly AiIndexingService _aiIndexingService;
 
     [ObservableProperty]
@@ -121,20 +123,56 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private ObservableCollection<MediaItem> _recentAiProcessedItems = new();
 
+    // --- ЧЛЕНЫ СЕМЬИ И ЛИЦА (FACE RECOGNITION) ---
+    [ObservableProperty]
+    private ObservableCollection<Person> _people = new();
+
+    [ObservableProperty]
+    private Person? _selectedPerson;
+
+    [ObservableProperty]
+    private string _newPersonName = "";
+
+    [ObservableProperty]
+    private string _newPersonNotes = "";
+
+    [ObservableProperty]
+    private bool _isFaceIndexingRunning;
+
+    [ObservableProperty]
+    private int _faceTotalPhotos;
+
+    [ObservableProperty]
+    private int _faceProcessedPhotos;
+
+    [ObservableProperty]
+    private double _faceIndexingProgress;
+
+    [ObservableProperty]
+    private string _faceIndexingStatusText = "Готов к сканированию лиц";
+
+    [ObservableProperty]
+    private int _totalKnownFacesCount;
+
     public MainViewModel(
         IAuditLogger auditLogger, 
         TelegramBotService botService, 
         IStorageSyncService syncService,
         IAiVisionService aiVisionService,
+        IFaceRecognitionService faceService,
+        FaceIndexingService faceIndexingService,
         AiIndexingService aiIndexingService)
     {
         _auditLogger = auditLogger;
         _botService = botService;
         _syncService = syncService;
         _aiVisionService = aiVisionService;
+        _faceService = faceService;
+        _faceIndexingService = faceIndexingService;
         _aiIndexingService = aiIndexingService;
 
         _aiIndexingService.ProgressChanged += OnAiIndexingProgressChanged;
+        _faceIndexingService.ProgressChanged += OnFaceIndexingProgressChanged;
 
         if (_auditLogger is AuditLogger loggerImpl)
         {
@@ -146,6 +184,7 @@ public partial class MainViewModel : ObservableObject
         LoadConfig();
         LoadData();
         RefreshAiStats();
+        RefreshFaceStats();
     }
 
     private void OnAiIndexingProgressChanged(object? sender, AiIndexingProgressEventArgs e)
@@ -162,6 +201,23 @@ public partial class MainViewModel : ObservableObject
             {
                 IsAiIndexingRunning = false;
                 RefreshAiStats();
+            }
+        });
+    }
+
+    private void OnFaceIndexingProgressChanged(object? sender, FaceIndexingProgressEventArgs e)
+    {
+        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        {
+            FaceTotalPhotos = e.TotalCount;
+            FaceProcessedPhotos = e.ProcessedCount;
+            FaceIndexingProgress = e.TotalCount > 0 ? (double)e.ProcessedCount / e.TotalCount * 100 : 0;
+            FaceIndexingStatusText = e.StatusMessage;
+
+            if (e.IsCompleted)
+            {
+                IsFaceIndexingRunning = false;
+                RefreshFaceStats();
             }
         });
     }
@@ -249,6 +305,12 @@ public partial class MainViewModel : ObservableObject
             Users.Add(u);
         }
 
+        People.Clear();
+        foreach (var p in db.People.Include(p => p.Faces).ToList())
+        {
+            People.Add(p);
+        }
+
         if (SelectedUser == null && Users.Any())
         {
             SelectedUser = Users.First();
@@ -293,6 +355,97 @@ public partial class MainViewModel : ObservableObject
             }
             catch { }
         });
+    }
+
+    public void RefreshFaceStats()
+    {
+        Task.Run(async () =>
+        {
+            try
+            {
+                using var db = new AppDbContext();
+                var totalFaces = await db.PersonFaces.CountAsync();
+                var peopleList = await db.People.Include(p => p.Faces).ToListAsync();
+
+                System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                {
+                    TotalKnownFacesCount = totalFaces;
+                    People.Clear();
+                    foreach (var p in peopleList)
+                    {
+                        People.Add(p);
+                    }
+                });
+            }
+            catch { }
+        });
+    }
+
+    [RelayCommand]
+    private async Task AddPersonAsync()
+    {
+        if (string.IsNullOrWhiteSpace(NewPersonName))
+        {
+            System.Windows.MessageBox.Show("Введите имя члена семьи!", "Внимание", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        using var db = new AppDbContext();
+        var person = new Person
+        {
+            Name = NewPersonName.Trim(),
+            Notes = NewPersonNotes.Trim(),
+            CreatedAt = DateTime.UtcNow
+        };
+
+        db.People.Add(person);
+        await db.SaveChangesAsync();
+
+        _auditLogger.Log("Info", "Faces", $"Добавлен член семьи: {person.Name}");
+
+        NewPersonName = "";
+        NewPersonNotes = "";
+        RefreshFaceStats();
+    }
+
+    [RelayCommand]
+    private async Task DeletePersonAsync(Person? person)
+    {
+        if (person == null) return;
+
+        if (System.Windows.MessageBox.Show($"Удалить профиль '{person.Name}'?", "Подтверждение", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+        {
+            using var db = new AppDbContext();
+            var p = await db.People.Include(p => p.Faces).FirstOrDefaultAsync(x => x.Id == person.Id);
+            if (p != null)
+            {
+                foreach (var face in p.Faces)
+                {
+                    face.PersonId = null;
+                }
+                db.People.Remove(p);
+                await db.SaveChangesAsync();
+
+                _auditLogger.Log("Info", "Faces", $"Удален профиль: {person.Name}");
+                RefreshFaceStats();
+            }
+        }
+    }
+
+    [RelayCommand]
+    private void StartFaceIndexing()
+    {
+        if (IsFaceIndexingRunning) return;
+        IsFaceIndexingRunning = true;
+        _ = _faceIndexingService.StartFaceIndexingAsync();
+    }
+
+    [RelayCommand]
+    private void StopFaceIndexing()
+    {
+        _faceIndexingService.Stop();
+        IsFaceIndexingRunning = false;
+        FaceIndexingStatusText = "Остановлено пользователем.";
     }
 
     [RelayCommand]
@@ -376,6 +529,7 @@ public partial class MainViewModel : ObservableObject
             LoadData();
             UpdateAvailableFoldersForSelectedSource();
             RefreshAiStats();
+            RefreshFaceStats();
             StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
         }
         finally
@@ -422,6 +576,7 @@ public partial class MainViewModel : ObservableObject
                 LoadData();
                 UpdateAvailableFoldersForSelectedSource();
                 RefreshAiStats();
+                RefreshFaceStats();
             });
         });
     }

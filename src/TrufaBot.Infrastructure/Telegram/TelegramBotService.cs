@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using TrufaBot.Application.Services;
+using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -7,7 +8,6 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using TrufaBot.Application.Interfaces;
-using TrufaBot.Application.Services;
 using TrufaBot.Domain.Entities;
 using TrufaBot.Infrastructure.Data;
 using TrufaBot.Infrastructure.Storage;
@@ -29,8 +29,8 @@ public class UserBrowseState
 public class TelegramBotService
 {
     private const long MaxTelegramUploadBytes = 49 * 1024 * 1024;
-    private const int DirPageSize = 20;   // 20 папок на страницу
-    private const int FilePageSize = 10;  // 10 медиафайлов (фото/видео) на страницу (лентой)
+    private const int DirPageSize = 20;
+    private const int FilePageSize = 10;
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -86,6 +86,7 @@ public class TelegramBotService
         {
             new BotCommand { Command = "start", Description = "🏠 Главное меню" },
             new BotCommand { Command = "browse", Description = "📁 Проводник папок" },
+            new BotCommand { Command = "people", Description = "👥 Члены семьи (по лицам)" },
             new BotCommand { Command = "search", Description = "🔍 Умный поиск по фото" },
             new BotCommand { Command = "random", Description = "🎲 Случайное фото" }
         }, cancellationToken: _cts.Token);
@@ -104,7 +105,8 @@ public class TelegramBotService
     {
         return new ReplyKeyboardMarkup(new[]
         {
-            new KeyboardButton[] { "📁 Проводник архива", "🎲 Случайное фото" }
+            new KeyboardButton[] { "📁 Проводник архива", "👥 Члены семьи" },
+            new KeyboardButton[] { "🎲 Случайное фото" }
         })
         {
             ResizeKeyboard = true,
@@ -185,12 +187,16 @@ public class TelegramBotService
         {
             await SendSourcesMenuAsync(bot, message.Chat.Id, null, user, db, ct);
         }
+        else if (text.Equals("👥 Члены семьи", StringComparison.OrdinalIgnoreCase) || text.Equals("/people", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendPeopleMenuAsync(bot, message.Chat.Id, null, user, db, ct);
+        }
         else if (text.StartsWith("/search", StringComparison.OrdinalIgnoreCase) || text.StartsWith("/find", StringComparison.OrdinalIgnoreCase))
         {
             var query = text.Contains(' ') ? text.Substring(text.IndexOf(' ') + 1).Trim() : "";
             if (string.IsNullOrEmpty(query))
             {
-                await bot.SendMessage(message.Chat.Id, "🔍 <b>Как искать по архиву:</b>\nНапишите запрос после команды, например:\n<code>/search море закат</code>\n<code>/search дети праздник</code>\n<code>/search документы чеки</code>", parseMode: ParseMode.Html, cancellationToken: ct);
+                await bot.SendMessage(message.Chat.Id, "🔍 <b>Как искать по архиву:</b>\nНапишите запрос после команды, например:\n<code>/search Илья на лыжах</code>\n<code>/search море закат</code>", parseMode: ParseMode.Html, cancellationToken: ct);
             }
             else
             {
@@ -204,14 +210,52 @@ public class TelegramBotService
         }
         else
         {
-            // Любой другой текст трактуется как быстрый умный поиск ИИ по архиву!
             await HandleSearchAsync(bot, message.Chat.Id, text, user, db, ct);
+        }
+    }
+
+    private async Task SendPeopleMenuAsync(ITelegramBotClient bot, long chatId, int? editMessageId, Domain.Entities.User user, AppDbContext db, CancellationToken ct)
+    {
+        var people = await db.People
+            .Include(p => p.Faces)
+            .OrderBy(p => p.Name)
+            .ToListAsync(ct);
+
+        var buttons = new List<InlineKeyboardButton[]>();
+        foreach (var person in people)
+        {
+            int faceCount = person.Faces.Count;
+            buttons.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"👤 {person.Name} ({faceCount} фото)", $"view_person_{person.Id}")
+            });
+        }
+
+        buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 Главное меню", "nav_main_menu") });
+
+        string messageText = buttons.Count > 1
+            ? "👥 <b>Выберите члена семьи для просмотра фотоальбома:</b>"
+            : "В базе пока нет добавленных членов семьи.\nДобавьте их в приложении на ПК во вкладке «Члены семьи».";
+
+        if (editMessageId.HasValue)
+        {
+            await SafeEditMessageTextAsync(bot, chatId, editMessageId.Value, messageText, new InlineKeyboardMarkup(buttons), ct);
+        }
+        else
+        {
+            await bot.SendMessage(
+                chatId,
+                messageText,
+                parseMode: ParseMode.Html,
+                replyMarkup: new InlineKeyboardMarkup(buttons),
+                cancellationToken: ct
+            );
         }
     }
 
     private async Task HandleSearchAsync(ITelegramBotClient bot, long chatId, string query, Domain.Entities.User user, AppDbContext db, CancellationToken ct)
     {
-        _logger.Log("Info", "Telegram", $"Умный поиск ИИ: '{query}' для @{user.DisplayName}", user.DisplayName);
+        _logger.Log("Info", "Telegram", $"Умный поиск ИИ/Лица: '{query}' для @{user.DisplayName}", user.DisplayName);
 
         var terms = query.ToLowerInvariant()
             .Split(new[] { ' ', ',', '.', ';', '!' }, StringSplitOptions.RemoveEmptyEntries)
@@ -220,16 +264,17 @@ public class TelegramBotService
 
         if (!terms.Any())
         {
-            await bot.SendMessage(chatId, "Введите хотя бы одно слово для поиска (например: <i>пляж, горы, собака</i>).", parseMode: ParseMode.Html, cancellationToken: ct);
+            await bot.SendMessage(chatId, "Введите хотя бы одно слово для поиска (например: <i>Илья, море, горы</i>).", parseMode: ParseMode.Html, cancellationToken: ct);
             return;
         }
 
         var allItems = await db.MediaItems
             .Include(m => m.StorageSource)
+            .Include(m => m.Faces)
+            .ThenInclude(f => f.Person)
             .Where(m => !m.IsDeleted && m.StorageSource.IsEnabled)
             .ToListAsync(ct);
 
-        // Ранжируем результаты по релевантности совпадений
         var scoredItems = allItems
             .Where(m => !IsIgnoredPath(m.RelativePath))
             .Where(m => _authService.CanAccessPath(user, m.StorageSourceId, m.RelativePath))
@@ -240,13 +285,18 @@ public class TelegramBotService
                 var tags = (m.AITags ?? "").ToLowerInvariant();
                 var name = m.FileName.ToLowerInvariant();
                 var path = m.RelativePath.ToLowerInvariant();
+                var personNames = m.Faces
+                    .Where(f => f.Person != null)
+                    .Select(f => f.Person!.Name.ToLowerInvariant())
+                    .ToList();
 
                 foreach (var term in terms)
                 {
-                    if (tags.Contains(term)) score += 5;       // Высокий вес за теги нейросети
-                    if (desc.Contains(term)) score += 3;       // Вес за описание ИИ
-                    if (name.Contains(term)) score += 2;       // Вес за имя файла
-                    if (path.Contains(term)) score += 1;       // Вес за путь к папке
+                    if (personNames.Any(p => p.Contains(term))) score += 10; // Высший приоритет за совпадение лица!
+                    if (tags.Contains(term)) score += 5;
+                    if (desc.Contains(term)) score += 3;
+                    if (name.Contains(term)) score += 2;
+                    if (path.Contains(term)) score += 1;
                 }
 
                 return new { Item = m, Score = score };
@@ -262,7 +312,7 @@ public class TelegramBotService
             await bot.SendMessage(
                 chatId,
                 $"🔍 По запросу «<b>{query}</b>» ничего не найдено.\n\n" +
-                $"💡 <i>Совет: Попробуйте поискать по общим словам (море, горы, праздник, природа, документы, авто) или запустите авто-тегирование в приложении на ПК.</i>",
+                $"💡 <i>Совет: Попробуйте поискать по имени человека (Илья, Анна) или по сюжету (море, горы, праздник, авто).</i>",
                 parseMode: ParseMode.Html,
                 replyMarkup: GetPersistentMenuKeyboard(),
                 cancellationToken: ct
@@ -290,6 +340,7 @@ public class TelegramBotService
         var inlineKeyboard = new InlineKeyboardMarkup(new[]
         {
             new[] { InlineKeyboardButton.WithCallbackData("📁 Проводник архива", "nav_sources") },
+            new[] { InlineKeyboardButton.WithCallbackData("👥 Члены семьи", "nav_people") },
             new[] { InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo") }
         });
 
@@ -297,7 +348,7 @@ public class TelegramBotService
             chatId,
             $"👋 Здравствуйте, <b>{user.DisplayName}</b>!\n\n" +
             $"Добро пожаловать в семейный архив медиафайлов.\n" +
-            $"💡 <i>Вы можете просто написать мне любое слово (например: «закат», «лыжи», «документ»), и я найду нужные фото с помощью встроенного ИИ!</i>",
+            $"💡 <i>Вы можете написать мне имя члена семьи (например: «Илья») или тему («закат на море»), и я найду нужные кадры с помощью встроенного ИИ и распознавания лиц!</i>",
             parseMode: ParseMode.Html,
             replyMarkup: inlineKeyboard,
             cancellationToken: ct
@@ -357,6 +408,42 @@ public class TelegramBotService
         if (data == "nav_main_menu")
         {
             await SendMainMenuAsync(bot, chatId, user, ct);
+        }
+        else if (data == "nav_people")
+        {
+            await SendPeopleMenuAsync(bot, chatId, messageId, user, db, ct);
+        }
+        else if (data.StartsWith("view_person_"))
+        {
+            if (int.TryParse(data.Substring("view_person_".Length), out int personId))
+            {
+                var person = await db.People.FindAsync(new object[] { personId }, ct);
+                if (person != null)
+                {
+                    var itemsWithPerson = await db.PersonFaces
+                        .Include(f => f.MediaItem)
+                        .ThenInclude(m => m.StorageSource)
+                        .Where(f => f.PersonId == personId && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                        .Select(f => f.MediaItem)
+                        .Distinct()
+                        .OrderByDescending(m => m.FileCreatedAt)
+                        .ToListAsync(ct);
+
+                    var state = new UserBrowseState
+                    {
+                        SourceId = itemsWithPerson.FirstOrDefault()?.StorageSourceId ?? 0,
+                        FolderPath = "",
+                        DirPage = 0,
+                        FilePage = 0,
+                        CachedFiles = itemsWithPerson,
+                        IsSearchMode = true,
+                        SearchQuery = $"Фотографии: {person.Name}"
+                    };
+
+                    _userSessions[userId] = state;
+                    await SendPhotoGalleryPageAsync(bot, chatId, user, db, state, ct);
+                }
+            }
         }
         else if (data == "random_photo")
         {
@@ -549,14 +636,12 @@ public class TelegramBotService
             fullTargetDir = source.RootPath;
         }
 
-        // Подпапки
         state.CachedSubDirs = Directory.GetDirectories(fullTargetDir)
             .Select(d => Path.GetRelativePath(source.RootPath, d).Replace('\\', '/'))
             .Where(rel => !IsIgnoredPath(rel) && _authService.CanViewFolder(user, state.SourceId, rel))
             .OrderBy(d => d)
             .ToList();
 
-        // Файлы
         var normalizedFolder = state.FolderPath.Trim('/');
         var allFolderFiles = await db.MediaItems
             .Where(m => m.StorageSourceId == state.SourceId && !m.IsDeleted)
@@ -575,14 +660,12 @@ public class TelegramBotService
 
         var hasMedia = state.CachedFiles.Any(f => ImageExtensions.Contains(f.FileExtension) || VideoExtensions.Contains(f.FileExtension));
 
-        // Если в открытой папке есть медиафайлы -> СРАЗУ отправляем ленту по 10 шт
         if (hasMedia)
         {
             await SendPhotoGalleryPageAsync(bot, chatId, user, db, state, ct);
         }
         else
         {
-            // Если медиа нет, а только папки -> выводим список папок
             await RenderBrowseViewAsync(bot, chatId, messageId, user, db, state, ct);
         }
     }
@@ -676,7 +759,6 @@ public class TelegramBotService
 
         var pageMedia = allMedia.Skip(state.FilePage * FilePageSize).Take(FilePageSize).ToList();
 
-        // 1. Предварительная быстрая параллельная генерация миниатюр
         using var tempDb = new AppDbContext();
         var sources = await tempDb.StorageSources.ToDictionaryAsync(s => s.Id, ct);
 
@@ -698,7 +780,6 @@ public class TelegramBotService
             .Where(t => !string.IsNullOrEmpty(t.ThumbPath))
             .ToList();
 
-        // 2. Отправляем карточки медиафайлов по 1 штуке в строку (лента)
         foreach (var entry in readyThumbs)
         {
             try
@@ -753,10 +834,8 @@ public class TelegramBotService
             }
         }
 
-        // 3. Панель навигации под лентой из 10 медиафайлов
         var navButtons = new List<InlineKeyboardButton[]>();
 
-        // Если в этой папке также есть подпапки, выводим их
         if (!state.IsSearchMode && state.CachedSubDirs.Any())
         {
             for (int i = 0; i < Math.Min(state.CachedSubDirs.Count, 6); i += 2)
@@ -771,7 +850,6 @@ public class TelegramBotService
             }
         }
 
-        // Строка пагинации по 10 шт
         var pageRow = new List<InlineKeyboardButton>();
         if (state.FilePage > 0)
         {
@@ -789,7 +867,7 @@ public class TelegramBotService
             navButtons.Add(new[]
             {
                 InlineKeyboardButton.WithCallbackData("📁 К папкам архива", "nav_sources"),
-                InlineKeyboardButton.WithCallbackData("🎲 Случайное фото", "random_photo")
+                InlineKeyboardButton.WithCallbackData("👥 Члены семьи", "nav_people")
             });
         }
         else
@@ -812,7 +890,7 @@ public class TelegramBotService
         string captionText;
         if (state.IsSearchMode)
         {
-            captionText = $"🔍 <b>Результаты поиска по:</b> «<i>{state.SearchQuery}</i>»\n" +
+            captionText = $"🔍 <b>Результаты:</b> «<i>{state.SearchQuery}</i>»\n" +
                           $"Показаны {startItemIndex}–{endItemIndex} из {totalItems} (Стр. {state.FilePage + 1} из {totalPages})";
         }
         else

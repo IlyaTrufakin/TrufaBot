@@ -26,6 +26,8 @@ public partial class App : System.Windows.Application
                 services.AddSingleton<IAuthorizationService, AuthorizationService>();
                 services.AddSingleton<IStorageSyncService, StorageSyncService>();
                 services.AddSingleton<IAiVisionService, AiVisionService>();
+                services.AddSingleton<IFaceRecognitionService, FaceRecognitionService>();
+                services.AddSingleton<FaceIndexingService>();
                 services.AddSingleton<AiIndexingService>();
                 services.AddSingleton<TelegramBotService>();
 
