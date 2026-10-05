@@ -61,9 +61,17 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
     public string FileName { get; set; } = "";
     public string FullImagePath { get; set; } = "";
     public string CropThumbnailPath { get; set; } = "";
+    public float[]? FaceVector { get; set; }
+
+    public Dictionary<int, List<float[]>>? Prototypes { get; set; }
 
     [ObservableProperty]
     private PersonItemViewModel? _selectedPerson;
+
+    partial void OnSelectedPersonChanged(PersonItemViewModel? value)
+    {
+        UpdateBadge();
+    }
 
     [ObservableProperty]
     private bool _hasSuggestion;
@@ -73,6 +81,15 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
 
     [ObservableProperty]
     private int _suggestedSimilarityPercent;
+
+    [ObservableProperty]
+    private string _badgeText = "❓ Новое лицо (0%)";
+
+    [ObservableProperty]
+    private string _badgeBackground = "#313244";
+
+    [ObservableProperty]
+    private string _badgeForeground = "#A6ADC8";
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CanRestore))]
@@ -86,6 +103,94 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
 
     public bool CanRestore => IsIgnored || IsFalsePositive;
     public bool CanIgnoreOrDelete => !IsIgnored && !IsFalsePositive;
+
+    public void UpdateBadge()
+    {
+        if (FaceVector == null || Prototypes == null || !Prototypes.Any())
+        {
+            BadgeText = "❓ Новый человек (0%)";
+            BadgeBackground = "#313244";
+            BadgeForeground = "#A6ADC8";
+            return;
+        }
+
+        // Если человек выбран в списке — считаем сходство именно с ним!
+        if (SelectedPerson != null && Prototypes.TryGetValue(SelectedPerson.Id, out var vecs) && vecs.Any())
+        {
+            double sim = 0;
+            foreach (var v in vecs)
+            {
+                var s = FaceRecognitionService.CalculateCosineSimilarity(FaceVector, v);
+                if (s > sim) sim = s;
+            }
+            int percent = (int)Math.Clamp(sim * 100, 0, 100);
+            SuggestedSimilarityPercent = percent;
+
+            if (percent >= 35)
+            {
+                BadgeText = $"💡 ИИ: {SelectedPerson.Name} ({percent}%)";
+                BadgeBackground = "#A6E3A1";
+                BadgeForeground = "#11111B";
+            }
+            else if (percent >= 20)
+            {
+                BadgeText = $"🔍 Похоже: {SelectedPerson.Name} ({percent}%)";
+                BadgeBackground = "#F9E2AF";
+                BadgeForeground = "#11111B";
+            }
+            else
+            {
+                BadgeText = $"⚠️ Сходство с {SelectedPerson.Name}: {percent}%";
+                BadgeBackground = "#45475A";
+                BadgeForeground = "#CDD6F4";
+            }
+            return;
+        }
+
+        // Если человек не выбран — находим лучший матч среди всех известных людей
+        int? bestId = null;
+        double bestSim = 0.0;
+        foreach (var (pId, list) in Prototypes)
+        {
+            foreach (var v in list)
+            {
+                var s = FaceRecognitionService.CalculateCosineSimilarity(FaceVector, v);
+                if (s > bestSim)
+                {
+                    bestSim = s;
+                    bestId = pId;
+                }
+            }
+        }
+
+        int maxPercent = (int)Math.Clamp(bestSim * 100, 0, 100);
+        SuggestedSimilarityPercent = maxPercent;
+
+        if (bestId.HasValue && maxPercent >= 35 && !string.IsNullOrEmpty(SuggestedPersonName))
+        {
+            BadgeText = $"💡 ИИ: {SuggestedPersonName} ({maxPercent}%)";
+            BadgeBackground = "#A6E3A1";
+            BadgeForeground = "#11111B";
+        }
+        else if (bestId.HasValue && maxPercent >= 20 && !string.IsNullOrEmpty(SuggestedPersonName))
+        {
+            BadgeText = $"🔍 Похоже: {SuggestedPersonName} ({maxPercent}%)";
+            BadgeBackground = "#F9E2AF";
+            BadgeForeground = "#11111B";
+        }
+        else if (maxPercent > 0)
+        {
+            BadgeText = $"❓ Новый? (макс. {maxPercent}%)";
+            BadgeBackground = "#313244";
+            BadgeForeground = "#A6ADC8";
+        }
+        else
+        {
+            BadgeText = "❓ Новое лицо (0%)";
+            BadgeBackground = "#313244";
+            BadgeForeground = "#A6ADC8";
+        }
+    }
 }
 
 public partial class PersonPhotoItemViewModel : ObservableObject
@@ -643,6 +748,21 @@ public partial class MainViewModel : ObservableObject
             foreach (var kf in knownFaces)
             {
                 var vec = FaceRecognitionService.DecodeEmbedding(kf.Embedding!);
+                if (FaceRecognitionService.IsLegacyDummyEmbedding(vec) && kf.MediaItem != null && kf.MediaItem.StorageSource != null)
+                {
+                    var kfPath = Path.Combine(kf.MediaItem.StorageSource.RootPath, kf.MediaItem.RelativePath.Replace('/', '\\'));
+                    if (File.Exists(kfPath))
+                    {
+                        var newEmb = _faceService.ExtractSFaceEmbeddingFromImage(kfPath, kf.BoxX, kf.BoxY, kf.BoxWidth, kf.BoxHeight);
+                        if (newEmb.Length == FaceRecognitionService.EmbeddingSize)
+                        {
+                            kf.Embedding = FaceRecognitionService.EncodeEmbedding(newEmb);
+                            vec = newEmb;
+                            await db.SaveChangesAsync();
+                        }
+                    }
+                }
+
                 if (vec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(vec))
                 {
                     if (!prototypes.ContainsKey(kf.PersonId!.Value))
@@ -655,15 +775,28 @@ public partial class MainViewModel : ObservableObject
 
             foreach (var face in faces)
             {
+                if (face.MediaItem?.StorageSource == null) continue;
                 var fullPath = Path.Combine(face.MediaItem.StorageSource.RootPath, face.MediaItem.RelativePath.Replace('/', '\\'));
                 var cropPath = await _faceService.GetOrCreateFaceCropThumbnailAsync(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight, face.Id);
+
+                // Вычисляем настоящий вектор SFace на лету, если в базе старый черновой вектор
+                var faceVec = FaceRecognitionService.DecodeEmbedding(face.Embedding ?? "");
+                if (FaceRecognitionService.IsLegacyDummyEmbedding(faceVec) && face.MediaItem != null && face.MediaItem.StorageSource != null && File.Exists(fullPath))
+                {
+                    var newEmb = _faceService.ExtractSFaceEmbeddingFromImage(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight);
+                    if (newEmb.Length == FaceRecognitionService.EmbeddingSize)
+                    {
+                        face.Embedding = FaceRecognitionService.EncodeEmbedding(newEmb);
+                        faceVec = newEmb;
+                        await db.SaveChangesAsync();
+                    }
+                }
 
                 PersonItemViewModel? suggestedPerson = null;
                 bool hasSuggestion = false;
                 int simPercent = 0;
 
                 // Умная подсказка: проверяем сходство лица с уже размеченными людьми
-                var faceVec = FaceRecognitionService.DecodeEmbedding(face.Embedding ?? "");
                 if (faceVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(faceVec) && prototypes.Any())
                 {
                     int? bestId = null;
@@ -681,6 +814,8 @@ public partial class MainViewModel : ObservableObject
                         }
                     }
 
+                    simPercent = (int)Math.Clamp(bestSim * 100, 0, 100);
+
                     // Если сходство >= 0.35, выставляем подсказку в выпадающий список
                     if (bestId.HasValue && bestSim >= 0.35)
                     {
@@ -688,25 +823,34 @@ public partial class MainViewModel : ObservableObject
                         if (suggestedPerson != null)
                         {
                             hasSuggestion = true;
-                            simPercent = (int)(bestSim * 100);
                         }
+                    }
+                    else if (bestId.HasValue && bestSim >= 0.20)
+                    {
+                        // При умеренном сходстве (20-34%) также выставляем предположение
+                        suggestedPerson = People.FirstOrDefault(p => p.Id == bestId.Value);
                     }
                 }
 
-                list.Add(new UnassignedFaceItemViewModel
+                var itemVm = new UnassignedFaceItemViewModel
                 {
                     FaceId = face.Id,
                     MediaItemId = face.MediaItemId,
-                    FileName = face.MediaItem.FileName,
+                    FileName = face.MediaItem?.FileName ?? "",
                     FullImagePath = fullPath,
                     CropThumbnailPath = cropPath,
-                    SelectedPerson = suggestedPerson,
+                    FaceVector = faceVec,
+                    Prototypes = prototypes,
                     HasSuggestion = hasSuggestion,
                     SuggestedPersonName = suggestedPerson?.Name ?? "",
                     SuggestedSimilarityPercent = simPercent,
                     IsIgnored = face.IsIgnored,
                     IsFalsePositive = face.IsFalsePositive
-                });
+                };
+                itemVm.SelectedPerson = suggestedPerson;
+                itemVm.UpdateBadge();
+
+                list.Add(itemVm);
             }
 
             System.Windows.Application.Current?.Dispatcher.Invoke(() =>
@@ -889,28 +1033,33 @@ public partial class MainViewModel : ObservableObject
 
             UnassignedFaces.Remove(item);
 
-            // Авто-распространение подсказки: если среди оставшихся на экране лиц есть очень похожие на только что подтвержденное, сразу предвыбираем этого же человека!
+            // Авто-распространение подсказки: обновляем эталоны во всех оставшихся карточках и пересчитываем бейджи!
             using (var db = new AppDbContext())
             {
                 var assignedFace = await db.PersonFaces.FindAsync(item.FaceId);
                 var assignedVec = FaceRecognitionService.DecodeEmbedding(assignedFace?.Embedding ?? "");
                 if (assignedVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(assignedVec))
                 {
-                    foreach (var other in UnassignedFaces.Where(o => o.SelectedPerson == null || !o.HasSuggestion))
+                    foreach (var other in UnassignedFaces)
                     {
-                        var otherFace = await db.PersonFaces.FindAsync(other.FaceId);
-                        var otherVec = FaceRecognitionService.DecodeEmbedding(otherFace?.Embedding ?? "");
-                        if (otherVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(otherVec))
+                        if (other.Prototypes != null)
                         {
-                            var sim = FaceRecognitionService.CalculateCosineSimilarity(assignedVec, otherVec);
-                            if (sim >= 0.35)
+                            if (!other.Prototypes.ContainsKey(personId))
+                                other.Prototypes[personId] = new List<float[]>();
+                            other.Prototypes[personId].Add(assignedVec);
+                        }
+
+                        if (other.FaceVector != null)
+                        {
+                            var sim = FaceRecognitionService.CalculateCosineSimilarity(assignedVec, other.FaceVector);
+                            if (sim >= 0.35 && (other.SelectedPerson == null || !other.HasSuggestion))
                             {
                                 other.SelectedPerson = People.FirstOrDefault(p => p.Id == personId);
                                 other.HasSuggestion = true;
                                 other.SuggestedPersonName = personName;
-                                other.SuggestedSimilarityPercent = (int)(sim * 100);
                             }
                         }
+                        other.UpdateBadge();
                     }
                 }
             }

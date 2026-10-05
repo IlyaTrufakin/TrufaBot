@@ -718,17 +718,16 @@
                                                 <Border Background="#313244" CornerRadius="6" Padding="7" Margin="0,0,10,0" Width="155">
                                                     <StackPanel>
                                                         <!-- Превью вырезанного лица -->
-                                                        <Border CornerRadius="4" ClipToBounds="True" Height="95" Background="#11111B" Margin="0,0,0,4">
+                                                        <Border CornerRadius="4" ClipToBounds="True" Height="95" Background="#11111B" Margin="0,0,0,4"
+                                                                ToolTip="{Binding BadgeText}">
                                                             <Image Source="{Binding CropThumbnailPath}" Stretch="UniformToFill"/>
                                                         </Border>
 
-                                                        <!-- Бейдж авто-подсказки ИИ с вероятностью в процентах -->
-                                                        <Border Visibility="{Binding HasSuggestion, Converter={StaticResource BoolToVisConverter}}" 
-                                                                Background="#A6E3A1" CornerRadius="3" Padding="4,2" Margin="0,0,0,4"
-                                                                ToolTip="ИИ распознал этого человека по образцам и выставил его в список!">
-                                                            <TextBlock FontSize="10" FontWeight="Bold" Foreground="#11111B" HorizontalAlignment="Center" TextTrimming="CharacterEllipsis">
-                                                                <Run Text="💡 ИИ: "/><Run Text="{Binding SuggestedPersonName}"/><Run Text=" ("/><Run Text="{Binding SuggestedSimilarityPercent}"/><Run Text="%)"/>
-                                                            </TextBlock>
+                                                        <!-- Бейдж предсказания ИИ с вероятностью в процентах (всегда видим) -->
+                                                        <Border Background="{Binding BadgeBackground}" CornerRadius="3" Padding="4,3" Margin="0,0,0,4"
+                                                                ToolTip="Вероятность совпадения лица с образцами в процентах">
+                                                            <TextBlock Text="{Binding BadgeText}" FontSize="10" FontWeight="Bold" 
+                                                                       Foreground="{Binding BadgeForeground}" HorizontalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                                                         </Border>
 
                                                         <!-- Имя файла -->

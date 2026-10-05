@@ -12,7 +12,7 @@ namespace TrufaBot.Infrastructure.Services;
 
 public class FaceRecognitionService : IFaceRecognitionService
 {
-    private const int EmbeddingSize = 128;
+    public const int EmbeddingSize = 128;
     private static readonly string FaceCacheDir = Path.Combine(AppPaths.CacheFolder, "faces");
     private static readonly string ModelDir = Path.Combine(AppPaths.AppDataFolder, "models");
     private static readonly string DetectorModelPath = Path.Combine(ModelDir, "version-RFB-320.onnx");
