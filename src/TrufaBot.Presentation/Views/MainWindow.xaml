@@ -675,8 +675,32 @@
                                         </Button>
                                     </StackPanel>
 
-                                    <!-- Правая панель: Случайная выборка и Обновление -->
+                                    <!-- Правая панель: Авто >85%, Случайная выборка и Обновление -->
                                     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                                        <Button Command="{Binding ToggleAutoAssignHighConfidenceCommand}" 
+                                                ToolTip="Автоматически отправлять лица с вероятностью >85% в альбом человека без необходимости кликать вручную">
+                                            <Button.Content>
+                                                <TextBlock Text="{Binding AutoAssignButtonText}"/>
+                                            </Button.Content>
+                                            <Button.Style>
+                                                <Style TargetType="Button">
+                                                    <Setter Property="Padding" Value="9,4"/>
+                                                    <Setter Property="Margin" Value="0,0,6,0"/>
+                                                    <Setter Property="Background" Value="#313244"/>
+                                                    <Setter Property="Foreground" Value="#CDD6F4"/>
+                                                    <Setter Property="FontWeight" Value="SemiBold"/>
+                                                    <Setter Property="FontSize" Value="11"/>
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsAutoAssignHighConfidenceEnabled}" Value="True">
+                                                            <Setter Property="Background" Value="#A6E3A1"/>
+                                                            <Setter Property="Foreground" Value="#11111B"/>
+                                                            <Setter Property="FontWeight" Value="Bold"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Button.Style>
+                                        </Button>
+
                                         <Button Command="{Binding ToggleRandomSampleModeCommand}" ToolTip="Случайная выборка (ORDER BY RANDOM) отбирает фото из разных годов и событий для лучшего обучения">
                                             <Button.Content>
                                                 <TextBlock Text="{Binding RandomModeButtonText}"/>

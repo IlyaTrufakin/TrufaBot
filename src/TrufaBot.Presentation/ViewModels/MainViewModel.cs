@@ -369,6 +369,12 @@ public partial class MainViewModel : ObservableObject
     public string RandomModeButtonText => IsRandomSampleMode ? "🎲 Случайно: ВКЛ" : "🕒 По порядку: ВКЛ";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(AutoAssignButtonText))]
+    private bool _isAutoAssignHighConfidenceEnabled = true;
+
+    public string AutoAssignButtonText => IsAutoAssignHighConfidenceEnabled ? "⚡ Авто >85%: ВКЛ" : "⚡ Авто >85%: ВЫКЛ";
+
+    [ObservableProperty]
     private int _unassignedCount;
 
     [ObservableProperty]
@@ -721,21 +727,24 @@ public partial class MainViewModel : ObservableObject
             }
 
             // 3. Выборка: случайная для разнообразия обучения или по порядку
-            List<PersonFace> faces;
+            // 3. Выборка: если включена авто-привязка >85%, берем с запасом (до 40 лиц),
+            // чтобы уверенные совпадения сразу улетели в альбом, а для разметки осталось ровно pageSize
             const int pageSize = 14;
+            int fetchLimit = (CurrentFaceFilter == FaceQueueFilter.Unassigned && IsAutoAssignHighConfidenceEnabled) ? 40 : pageSize;
 
+            List<PersonFace> faces;
             if (IsRandomSampleMode)
             {
                 faces = await query
                     .OrderBy(f => EF.Functions.Random())
-                    .Take(pageSize)
+                    .Take(fetchLimit)
                     .ToListAsync();
             }
             else
             {
                 faces = await query
                     .OrderByDescending(f => f.Id)
-                    .Take(pageSize)
+                    .Take(fetchLimit)
                     .ToListAsync();
             }
 
@@ -772,6 +781,7 @@ public partial class MainViewModel : ObservableObject
             }
 
             var list = new List<UnassignedFaceItemViewModel>();
+            int autoAssignedCount = 0;
 
             foreach (var face in faces)
             {
@@ -816,6 +826,33 @@ public partial class MainViewModel : ObservableObject
 
                     simPercent = (int)Math.Clamp(bestSim * 100, 0, 100);
 
+                    // ⚡ АВТО-ПРИВЯЗКА ПРИ ВЕРОЯТНОСТИ БОЛЕЕ 85%:
+                    // Лицо сразу автоматически отправляется в соответствующий раздел человека!
+                    if (CurrentFaceFilter == FaceQueueFilter.Unassigned && IsAutoAssignHighConfidenceEnabled && bestId.HasValue && simPercent >= 85)
+                    {
+                        var matchedPerson = People.FirstOrDefault(p => p.Id == bestId.Value);
+                        if (matchedPerson != null)
+                        {
+                            face.PersonId = bestId.Value;
+                            face.IsIgnored = false;
+                            face.IsFalsePositive = false;
+                            if (face.MediaItem != null)
+                            {
+                                FaceRecognitionService.AddPersonNameToMediaTags(face.MediaItem, matchedPerson.Name);
+                            }
+                            await db.SaveChangesAsync();
+
+                            // Добавляем этот отпечаток в эталоны персоны для дальнейшего Few-Shot распознавания
+                            if (!prototypes.ContainsKey(bestId.Value))
+                                prototypes[bestId.Value] = new List<float[]>();
+                            prototypes[bestId.Value].Add(faceVec);
+
+                            autoAssignedCount++;
+                            _auditLogger.Log("Info", "Faces", $"[Авто >85%] Фото '{face.MediaItem?.FileName}' автоматически отправлено в альбом '{matchedPerson.Name}' ({simPercent}%).");
+                            continue; // Не выводим в очередь неразмеченных — оно уже отправлено в раздел человека!
+                        }
+                    }
+
                     // Если сходство >= 0.35, выставляем подсказку в выпадающий список
                     if (bestId.HasValue && bestSim >= 0.35)
                     {
@@ -851,6 +888,20 @@ public partial class MainViewModel : ObservableObject
                 itemVm.UpdateBadge();
 
                 list.Add(itemVm);
+                if (list.Count >= pageSize)
+                {
+                    break;
+                }
+            }
+
+            if (autoAssignedCount > 0)
+            {
+                RefreshFaceStats();
+                if (SelectedPerson != null)
+                {
+                    LoadPhotosForSelectedPerson(SelectedPerson);
+                }
+                StatusText = $"⚡ Автоматически отправлено {autoAssignedCount} фото с уверенностью >85% в альбомы людей!";
             }
 
             System.Windows.Application.Current?.Dispatcher.Invoke(() =>
@@ -894,6 +945,16 @@ public partial class MainViewModel : ObservableObject
     {
         IsRandomSampleMode = !IsRandomSampleMode;
         await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task ToggleAutoAssignHighConfidenceAsync()
+    {
+        IsAutoAssignHighConfidenceEnabled = !IsAutoAssignHighConfidenceEnabled;
+        if (IsAutoAssignHighConfidenceEnabled)
+        {
+            await LoadUnassignedFacesAsync();
+        }
     }
 
     [RelayCommand]
@@ -1034,12 +1095,15 @@ public partial class MainViewModel : ObservableObject
             UnassignedFaces.Remove(item);
 
             // Авто-распространение подсказки: обновляем эталоны во всех оставшихся карточках и пересчитываем бейджи!
+            int cascadeAutoAssigned = 0;
             using (var db = new AppDbContext())
             {
                 var assignedFace = await db.PersonFaces.FindAsync(item.FaceId);
                 var assignedVec = FaceRecognitionService.DecodeEmbedding(assignedFace?.Embedding ?? "");
                 if (assignedVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(assignedVec))
                 {
+                    var toAutoAssign = new List<UnassignedFaceItemViewModel>();
+
                     foreach (var other in UnassignedFaces)
                     {
                         if (other.Prototypes != null)
@@ -1052,6 +1116,15 @@ public partial class MainViewModel : ObservableObject
                         if (other.FaceVector != null)
                         {
                             var sim = FaceRecognitionService.CalculateCosineSimilarity(assignedVec, other.FaceVector);
+                            int simPct = (int)Math.Clamp(sim * 100, 0, 100);
+
+                            // Если включена авто-привязка >85% и сходство >= 85% — сразу отправляем в альбом человека!
+                            if (IsAutoAssignHighConfidenceEnabled && simPct >= 85)
+                            {
+                                toAutoAssign.Add(other);
+                                continue;
+                            }
+
                             if (sim >= 0.35 && (other.SelectedPerson == null || !other.HasSuggestion))
                             {
                                 other.SelectedPerson = People.FirstOrDefault(p => p.Id == personId);
@@ -1061,7 +1134,20 @@ public partial class MainViewModel : ObservableObject
                         }
                         other.UpdateBadge();
                     }
+
+                    foreach (var autoItem in toAutoAssign)
+                    {
+                        await _faceService.AssignFaceToPersonAsync(autoItem.FaceId, personId);
+                        UnassignedFaces.Remove(autoItem);
+                        cascadeAutoAssigned++;
+                        _auditLogger.Log("Info", "Faces", $"[Авто >85%] Похожее фото '{autoItem.FileName}' автоматически отправлено в альбом '{personName}'.");
+                    }
                 }
+            }
+
+            if (cascadeAutoAssigned > 0)
+            {
+                StatusText = $"⚡ Привязано фото + {cascadeAutoAssigned} похожих фото (>85%) отправлены в альбом '{personName}'!";
             }
 
             RefreshFaceStats();
