@@ -801,6 +801,189 @@ public class FaceRecognitionService : IFaceRecognitionService
         catch { }
     }
 
+    public static void NormalizeEmbedding(float[] v)
+    {
+        double sum = 0;
+        for (int i = 0; i < v.Length; i++) sum += v[i] * v[i];
+        double norm = Math.Sqrt(sum);
+        if (norm > 0)
+        {
+            for (int i = 0; i < v.Length; i++) v[i] = (float)(v[i] / norm);
+        }
+    }
+
+    /// <summary>
+    /// Вторичная переборка: находит робастное ядро (эталонный кластер) внешности человека и
+    /// отсеивает из его альбома все сомнительные лица (чужие лица или лица со слабым сходством) обратно в «Неразмеченные».
+    /// </summary>
+    public async Task<(int totalChecked, int keptCount, int discardedCount)> PrunePersonOutliersAsync(int personId, float threshold = 0.36f, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+
+        var person = await db.People.FindAsync(new object[] { personId }, ct);
+        if (person == null) return (0, 0, 0);
+
+        var personFaces = await db.PersonFaces
+            .Include(f => f.MediaItem)
+            .Where(f => f.PersonId == personId && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+            .ToListAsync(ct);
+
+        if (personFaces.Count < 3)
+        {
+            return (personFaces.Count, personFaces.Count, 0);
+        }
+
+        var faceVectors = new List<(PersonFace face, float[] vec)>();
+        foreach (var f in personFaces)
+        {
+            var v = DecodeEmbedding(f.Embedding ?? "");
+            if (v != null && !IsLegacyDummyEmbedding(v))
+            {
+                faceVectors.Add((f, v));
+            }
+        }
+
+        if (faceVectors.Count < 3)
+        {
+            return (personFaces.Count, personFaces.Count, 0);
+        }
+
+        // Загружаем центроиды других людей для выявления явных пересечений
+        var otherPeopleFaces = await db.PersonFaces
+            .Where(f => f.PersonId != null && f.PersonId != personId && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+            .Select(f => new { f.PersonId, f.Embedding })
+            .ToListAsync(ct);
+
+        var otherCentroids = new Dictionary<int, float[]>();
+        foreach (var group in otherPeopleFaces.GroupBy(f => f.PersonId!.Value))
+        {
+            var vecs = new List<float[]>();
+            foreach (var item in group)
+            {
+                var v = DecodeEmbedding(item.Embedding ?? "");
+                if (v != null && !IsLegacyDummyEmbedding(v)) vecs.Add(v);
+            }
+
+            if (vecs.Count >= 3)
+            {
+                var c = new float[EmbeddingSize];
+                foreach (var v in vecs)
+                {
+                    for (int i = 0; i < EmbeddingSize; i++) c[i] += v[i];
+                }
+                NormalizeEmbedding(c);
+                otherCentroids[group.Key] = c;
+            }
+        }
+
+        // Вычисляем робастный эталонный центроид (Trimmed Centroid) для человека
+        var c0 = new float[EmbeddingSize];
+        foreach (var (_, v) in faceVectors)
+        {
+            for (int i = 0; i < EmbeddingSize; i++) c0[i] += v[i];
+        }
+        NormalizeEmbedding(c0);
+
+        var scores = faceVectors.Select(x => (item: x, sim: (float)CalculateCosineSimilarity(x.vec, c0))).ToList();
+        var sortedSims = scores.Select(x => x.sim).OrderBy(s => s).ToList();
+
+        // Отбираем верхние 60% наиболее согласованных лиц для истинного ядра
+        float coreCutoff = Math.Max(0.40f, sortedSims[(int)(sortedSims.Count * 0.40)]);
+        var coreVecs = scores.Where(x => x.sim >= coreCutoff).Select(x => x.item.vec).ToList();
+        if (coreVecs.Count < 3)
+        {
+            coreVecs = scores.Where(x => x.sim >= sortedSims[sortedSims.Count / 2]).Select(x => x.item.vec).ToList();
+        }
+
+        var cCore = new float[EmbeddingSize];
+        foreach (var v in coreVecs)
+        {
+            for (int i = 0; i < EmbeddingSize; i++) cCore[i] += v[i];
+        }
+        NormalizeEmbedding(cCore);
+
+        // Проверяем каждое лицо
+        int discardedCount = 0;
+        int keptCount = 0;
+        var affectedMedia = new HashSet<MediaItem>();
+
+        foreach (var (face, v) in faceVectors)
+        {
+            double mySim = CalculateCosineSimilarity(v, cCore);
+
+            double bestOtherSim = 0.0;
+            foreach (var (_, oc) in otherCentroids)
+            {
+                double sim = CalculateCosineSimilarity(v, oc);
+                if (sim > bestOtherSim) bestOtherSim = sim;
+            }
+
+            bool isOutlier = false;
+            if (mySim < threshold)
+            {
+                isOutlier = true;
+            }
+            else if (bestOtherSim > mySim + 0.05 && bestOtherSim >= 0.40)
+            {
+                isOutlier = true;
+            }
+
+            if (isOutlier)
+            {
+                face.PersonId = null;
+                discardedCount++;
+                if (face.MediaItem != null)
+                {
+                    affectedMedia.Add(face.MediaItem);
+                }
+            }
+            else
+            {
+                keptCount++;
+            }
+        }
+
+        foreach (var media in affectedMedia)
+        {
+            bool stillHasPerson = personFaces.Any(f => f.MediaItemId == media.Id && f.PersonId == personId);
+            if (!stillHasPerson)
+            {
+                RemovePersonNameFromMediaTags(media, person.Name);
+            }
+        }
+
+        if (discardedCount > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        return (personFaces.Count, keptCount, discardedCount);
+    }
+
+    /// <summary>
+    /// Вторичная переборка для всех людей в базе: очищает альбомы всех персон от сомнительных лиц
+    /// </summary>
+    public async Task<(int totalChecked, int keptCount, int discardedCount)> PruneAllPeopleOutliersAsync(float threshold = 0.36f, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var people = await db.People.OrderBy(p => p.Name).ToListAsync(ct);
+
+        int totalAll = 0;
+        int keptAll = 0;
+        int discardedAll = 0;
+
+        foreach (var p in people)
+        {
+            if (ct.IsCancellationRequested) break;
+            var (tot, kept, disc) = await PrunePersonOutliersAsync(p.Id, threshold, ct);
+            totalAll += tot;
+            keptAll += kept;
+            discardedAll += disc;
+        }
+
+        return (totalAll, keptAll, discardedAll);
+    }
+
     public static void AddPersonNameToMediaTags(MediaItem item, string personName)
     {
         if (string.IsNullOrWhiteSpace(personName)) return;

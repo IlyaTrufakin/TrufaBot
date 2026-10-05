@@ -546,6 +546,9 @@
                                         <Button Content="⚡ Обучить и найти всех по архиву" Command="{Binding AutoMatchAllFacesCommand}" 
                                                 Padding="10,6" Margin="0,0,6,0" Background="#F9E2AF" Foreground="#11111B" FontWeight="Bold" 
                                                 ToolTip="Обучает нейросеть SFace на подтвержденных вами образцах (1-3 фото на человека) и автоматически раскладывает все остальные фото архива по альбомам с добавлением имен в теги!"/>
+                                        <Button Content="🧹 Перебрать весь архив" Command="{Binding PruneAllPeopleOutliersCommand}" 
+                                                Padding="8,6" Margin="0,0,6,0" Background="#FAB387" Foreground="#11111B" FontWeight="Bold" 
+                                                ToolTip="Вторичная переборка: отсеять сомнительные и ошибочно привязанные лица по всем альбомам обратно в «Неразмеченные»"/>
                                         <Button Content="🏷 Обновить теги на фото" Command="{Binding SyncPersonTagsCommand}" 
                                                 Padding="8,6" Margin="0,0,6,0" Background="#89B4FA" Foreground="#11111B" FontWeight="Bold"
                                                 ToolTip="Прописать имена людей в текстовые теги (AITags) всех фотографий для мгновенного поиска"/>
@@ -841,6 +844,13 @@
                                                 Padding="10,3" Margin="8,0,0,0"
                                                 Background="#313244" Foreground="#F9E2AF" FontWeight="Bold" FontSize="11"
                                                 ToolTip="Переключить показ между полными фотографиями и вырезанными лицами крупным планом для быстрой проверки"/>
+
+                                        <!-- Вторичная переборка альбома выбранного человека -->
+                                        <Button Content="🧹 Вторичная переборка" 
+                                                Command="{Binding PruneSelectedPersonOutliersCommand}"
+                                                Padding="10,3" Margin="8,0,0,0"
+                                                Background="#FAB387" Foreground="#11111B" FontWeight="Bold" FontSize="11"
+                                                ToolTip="Найти эталонный образ этого человека и выбросить в «Неразмеченные» все сомнительные фото (чужие лица или лица со слабым сходством)"/>
                                     </StackPanel>
 
                                     <TextBlock Grid.Column="1" Text="💡 Кликните «❌ Отвязать» на карточке фото, чтобы убрать его из альбома" 

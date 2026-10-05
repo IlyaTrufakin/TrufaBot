@@ -29,6 +29,8 @@ public interface IFaceRecognitionService
     Task MarkFalsePositiveAsync(long faceId, CancellationToken ct = default);
     Task RestoreFaceAsync(long faceId, CancellationToken ct = default);
     Task DeleteFaceAsync(long faceId, CancellationToken ct = default);
+    Task<(int totalChecked, int keptCount, int discardedCount)> PrunePersonOutliersAsync(int personId, float threshold = 0.36f, CancellationToken ct = default);
+    Task<(int totalChecked, int keptCount, int discardedCount)> PruneAllPeopleOutliersAsync(float threshold = 0.36f, CancellationToken ct = default);
     Task ResetAllAssignmentsAsync(CancellationToken ct = default);
     Task ClearAllFacesAndResetAsync(CancellationToken ct = default);
 }

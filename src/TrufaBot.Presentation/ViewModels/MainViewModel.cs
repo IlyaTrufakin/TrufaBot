@@ -1259,6 +1259,81 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private async Task PruneSelectedPersonOutliersAsync()
+    {
+        if (SelectedPerson == null)
+        {
+            System.Windows.MessageBox.Show("Пожалуйста, сначала выберите человека слева!", "Вторичная переборка", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var person = SelectedPerson;
+        var confirm = System.Windows.MessageBox.Show(
+            $"Выполнить вторичную переборку для «{person.Name}»?\n\n" +
+            "Нейросеть SFace автоматически определит эталонный образ этого человека и отвяжет в «Неразмеченные» все сомнительные фото (чужие лица или лица со слабым сходством).\n\n" +
+            "Все ваши фотографии останутся на диске в полной сохранности.",
+            "Вторичная переборка альбома",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (confirm != MessageBoxResult.Yes) return;
+
+        StatusText = $"⏳ Вторичная переборка для «{person.Name}»...";
+        var (totalChecked, keptCount, discardedCount) = await _faceService.PrunePersonOutliersAsync(person.Id, threshold: 0.36f);
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+
+        _auditLogger.Log("Info", "Faces", $"Вторичная переборка для '{person.Name}': проверено {totalChecked}, подтверждено {keptCount}, отсеяно {discardedCount}.");
+
+        RefreshFaceStats();
+        await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
+
+        System.Windows.MessageBox.Show(
+            $"Вторичная переборка для «{person.Name}» завершена!\n\n" +
+            $"• Проверено лиц в альбоме: {totalChecked}\n" +
+            $"• Подтверждено и оставлено: {keptCount}\n" +
+            $"• Отсеяно в «Неразмеченные»: {discardedCount}\n\n" +
+            (discardedCount > 0 ? "Отсеянные сомнительные лица теперь находятся во вкладке «Неразмеченные» и готовы для правильного распределения." : "Все лица в альбоме идеально соответствуют этому человеку!"),
+            "Результаты переборки",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    [RelayCommand]
+    private async Task PruneAllPeopleOutliersAsync()
+    {
+        var confirm = System.Windows.MessageBox.Show(
+            "Выполнить вторичную переборку для ВСЕХ людей в архиве?\n\n" +
+            "Нейросеть SFace проанализирует альбомы каждого человека и отсеет в «Неразмеченные» все сомнительные фото (чужие лица или ошибки раннего распознавания).\n\n" +
+            "Фотографии останутся на диске в полной сохранности.",
+            "Вторичная переборка всего архива",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (confirm != MessageBoxResult.Yes) return;
+
+        StatusText = "⏳ Вторичная переборка всех альбомов по архиву...";
+        var (totalChecked, keptCount, discardedCount) = await _faceService.PruneAllPeopleOutliersAsync(threshold: 0.36f);
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+
+        _auditLogger.Log("Info", "Faces", $"Вторичная переборка всего архива: проверено {totalChecked}, подтверждено {keptCount}, отсеяно {discardedCount}.");
+
+        RefreshFaceStats();
+        await LoadUnassignedFacesAsync();
+        LoadPhotosForSelectedPerson(SelectedPerson);
+
+        System.Windows.MessageBox.Show(
+            $"Вторичная переборка всего архива завершена!\n\n" +
+            $"• Проверено лиц во всех альбомах: {totalChecked}\n" +
+            $"• Подтверждено и оставлено: {keptCount}\n" +
+            $"• Отсеяно в «Неразмеченные»: {discardedCount}\n\n" +
+            "Все сомнительные лица возвращены в очередь «Неразмеченные» для проверки.",
+            "Результаты переборки архива",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    [RelayCommand]
     private async Task AssignFaceAsync(UnassignedFaceItemViewModel? item)
     {
         if (item == null || item.SelectedPerson == null)
