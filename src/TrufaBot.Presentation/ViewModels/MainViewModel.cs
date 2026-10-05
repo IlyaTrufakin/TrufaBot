@@ -389,6 +389,21 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private ObservableCollection<PersonPhotoItemViewModel> _selectedPersonPhotos = new();
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanLoadMorePersonPhotos))]
+    [NotifyPropertyChangedFor(nameof(HasNoSelectedPersonPhotos))]
+    private bool _isLoadingPersonPhotos;
+
+    public bool CanLoadMorePersonPhotos =>
+        !IsLoadingPersonPhotos &&
+        SelectedPerson != null &&
+        SelectedPerson.PhotosCount > SelectedPersonPhotos.Count;
+
+    public bool HasNoSelectedPersonPhotos =>
+        !IsLoadingPersonPhotos &&
+        SelectedPerson != null &&
+        SelectedPersonPhotos.Count == 0;
+
     public MainViewModel(
         IAuditLogger auditLogger, 
         TelegramBotService botService, 
@@ -407,6 +422,12 @@ public partial class MainViewModel : ObservableObject
         _faceService = faceService;
         _faceIndexingService = faceIndexingService;
         _aiIndexingService = aiIndexingService;
+
+        SelectedPersonPhotos.CollectionChanged += (s, e) =>
+        {
+            OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+            OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+        };
 
         _aiIndexingService.ProgressChanged += OnAiIndexingProgressChanged;
         _faceIndexingService.ProgressChanged += OnFaceIndexingProgressChanged;
@@ -471,9 +492,29 @@ public partial class MainViewModel : ObservableObject
         UpdateAvailableFoldersForSelectedSource();
     }
 
-    partial void OnSelectedPersonChanged(PersonItemViewModel? value)
+    partial void OnSelectedPersonChanged(PersonItemViewModel? oldValue, PersonItemViewModel? newValue)
     {
-        LoadPhotosForSelectedPerson(value);
+        if (oldValue != null)
+        {
+            oldValue.PropertyChanged -= OnSelectedPersonPropertyChanged;
+        }
+        if (newValue != null)
+        {
+            newValue.PropertyChanged += OnSelectedPersonPropertyChanged;
+        }
+
+        OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+        OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+        LoadPhotosForSelectedPerson(newValue);
+    }
+
+    private void OnSelectedPersonPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(PersonItemViewModel.PhotosCount))
+        {
+            OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+            OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+        }
     }
 
     private void OnLogAdded(AuditLogEntry entry)
@@ -980,55 +1021,111 @@ public partial class MainViewModel : ObservableObject
         if (person == null)
         {
             SelectedPersonPhotos.Clear();
+            OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+            OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
             return;
         }
 
+        SelectedPersonPhotos.Clear();
+        OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+        OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+
         Task.Run(async () =>
         {
-            try
+            await LoadPersonPhotosBatchAsync(person.Id, skip: 0, take: 50, append: false);
+        });
+    }
+
+    [RelayCommand]
+    private async Task LoadMorePersonPhotosAsync()
+    {
+        if (SelectedPerson == null || IsLoadingPersonPhotos) return;
+        var personId = SelectedPerson.Id;
+        var currentCount = SelectedPersonPhotos.Count;
+        await LoadPersonPhotosBatchAsync(personId, skip: currentCount, take: 50, append: true);
+    }
+
+    [RelayCommand]
+    private async Task LoadManyMorePersonPhotosAsync()
+    {
+        if (SelectedPerson == null || IsLoadingPersonPhotos) return;
+        var personId = SelectedPerson.Id;
+        var currentCount = SelectedPersonPhotos.Count;
+        await LoadPersonPhotosBatchAsync(personId, skip: currentCount, take: 200, append: true);
+    }
+
+    private async Task LoadPersonPhotosBatchAsync(int personId, int skip, int take, bool append)
+    {
+        if (IsLoadingPersonPhotos) return;
+
+        try
+        {
+            IsLoadingPersonPhotos = true;
+            OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+            OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+
+            using var db = new AppDbContext();
+            var photos = await db.PersonFaces
+                .Include(f => f.MediaItem)
+                .ThenInclude(m => m.StorageSource)
+                .Where(f => f.PersonId == personId && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                .Select(f => f.MediaItem)
+                .Distinct()
+                .OrderByDescending(m => m.FileCreatedAt)
+                .Skip(skip)
+                .Take(take)
+                .ToListAsync();
+
+            var viewModels = new List<PersonPhotoItemViewModel>();
+
+            foreach (var photo in photos)
             {
-                using var db = new AppDbContext();
-                var photos = await db.PersonFaces
-                    .Include(f => f.MediaItem)
-                    .ThenInclude(m => m.StorageSource)
-                    .Where(f => f.PersonId == person.Id && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
-                    .Select(f => f.MediaItem)
-                    .Distinct()
-                    .OrderByDescending(m => m.FileCreatedAt)
-                    .Take(50)
-                    .ToListAsync();
+                var fullPath = Path.Combine(photo.StorageSource.RootPath, photo.RelativePath.Replace('/', '\\'));
+                var thumb = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 240, 240);
 
-                var viewModels = new List<PersonPhotoItemViewModel>();
-
-                foreach (var photo in photos)
+                viewModels.Add(new PersonPhotoItemViewModel
                 {
-                    var fullPath = Path.Combine(photo.StorageSource.RootPath, photo.RelativePath.Replace('/', '\\'));
-                    var thumb = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 240, 240);
+                    MediaItemId = photo.Id,
+                    FileName = photo.FileName,
+                    RelativePath = photo.RelativePath,
+                    FullImagePath = fullPath,
+                    ThumbnailPath = thumb,
+                    AIDescription = photo.AIDescription,
+                    FileCreatedAt = photo.FileCreatedAt
+                });
+            }
 
-                    viewModels.Add(new PersonPhotoItemViewModel
-                    {
-                        MediaItemId = photo.Id,
-                        FileName = photo.FileName,
-                        RelativePath = photo.RelativePath,
-                        FullImagePath = fullPath,
-                        ThumbnailPath = thumb,
-                        AIDescription = photo.AIDescription,
-                        FileCreatedAt = photo.FileCreatedAt
-                    });
-                }
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            {
+                if (SelectedPerson?.Id != personId) return;
 
-                System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                if (!append)
                 {
                     SelectedPersonPhotos.Clear();
-                    foreach (var vm in viewModels)
+                }
+
+                foreach (var vm in viewModels)
+                {
+                    if (!SelectedPersonPhotos.Any(x => x.MediaItemId == vm.MediaItemId))
                     {
                         SelectedPersonPhotos.Add(vm);
                     }
-                    person.PhotosCount = SelectedPersonPhotos.Count;
-                });
-            }
-            catch { }
-        });
+                }
+
+                OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+                OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+            });
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка загрузки фото человека: {ex.Message}");
+        }
+        finally
+        {
+            IsLoadingPersonPhotos = false;
+            OnPropertyChanged(nameof(CanLoadMorePersonPhotos));
+            OnPropertyChanged(nameof(HasNoSelectedPersonPhotos));
+        }
     }
 
     [RelayCommand]

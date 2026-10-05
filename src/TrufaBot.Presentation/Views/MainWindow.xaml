@@ -816,52 +816,100 @@
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
 
-                                    <TextBlock FontWeight="Bold" Foreground="#89B4FA" VerticalAlignment="Center">
-                                        <Run Text="🖼 Альбом фотографий: "/>
-                                        <Run Text="{Binding SelectedPerson.Name, FallbackValue='(выберите человека слева)'}" Foreground="#FFFFFF" FontWeight="ExtraBold" FontSize="15"/>
-                                        <Run Text=" ("/>
-                                        <Run Text="{Binding SelectedPersonPhotos.Count, Mode=OneWay}"/>
-                                        <Run Text=" фото)"/>
-                                    </TextBlock>
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                        <TextBlock FontWeight="Bold" Foreground="#89B4FA" VerticalAlignment="Center">
+                                            <Run Text="🖼 Альбом фотографий: "/>
+                                            <Run Text="{Binding SelectedPerson.Name, FallbackValue='(выберите человека слева)'}" Foreground="#FFFFFF" FontWeight="ExtraBold" FontSize="15"/>
+                                            <Run Text=" — Всего: "/>
+                                            <Run Text="{Binding SelectedPerson.PhotosCount, FallbackValue='0'}" Foreground="#A6E3A1" FontWeight="Bold" FontSize="15"/>
+                                            <Run Text=" фото"/>
+                                            <Run Text=" (показано " Foreground="#A6ADC8" FontSize="12"/>
+                                            <Run Text="{Binding SelectedPersonPhotos.Count, Mode=OneWay}" Foreground="#FFFFFF" FontWeight="SemiBold" FontSize="12"/>
+                                            <Run Text=")" Foreground="#A6ADC8" FontSize="12"/>
+                                        </TextBlock>
+
+                                        <Button Content="➕ Загрузить еще 50 фото" 
+                                                Command="{Binding LoadMorePersonPhotosCommand}"
+                                                Visibility="{Binding CanLoadMorePersonPhotos, Converter={StaticResource BoolToVisConverter}}"
+                                                Padding="8,3" Margin="14,0,0,0"
+                                                Background="#313244" Foreground="#89B4FA" FontWeight="Bold" FontSize="11"
+                                                ToolTip="Подгрузить следующие 50 фотографий в галерею"/>
+                                    </StackPanel>
 
                                     <TextBlock Grid.Column="1" Text="💡 Кликните «❌ Отвязать» на карточке фото, чтобы убрать его из альбома" 
                                                Foreground="#A6ADC8" FontSize="11" VerticalAlignment="Center"/>
                                 </Grid>
 
                                 <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                                    <ItemsControl ItemsSource="{Binding SelectedPersonPhotos}">
-                                        <ItemsControl.ItemsPanel>
-                                            <ItemsPanelTemplate>
-                                                <WrapPanel Orientation="Horizontal"/>
-                                            </ItemsPanelTemplate>
-                                        </ItemsControl.ItemsPanel>
-                                        <ItemsControl.ItemTemplate>
-                                            <DataTemplate>
-                                                <Border Background="#313244" CornerRadius="6" Padding="6" Margin="0,0,10,10" Width="150">
-                                                    <StackPanel>
-                                                        <!-- Миниатюра фотографии -->
-                                                        <Border CornerRadius="4" ClipToBounds="True" Height="110" Background="#11111B" Margin="0,0,0,6">
-                                                            <Image Source="{Binding ThumbnailPath}" Stretch="UniformToFill"/>
-                                                        </Border>
+                                    <StackPanel>
+                                        <!-- Сообщение если у человека еще нет подтвержденных фото -->
+                                        <TextBlock Text="У этого человека пока нет подтвержденных фотографий." 
+                                                   Foreground="#A6ADC8" FontSize="13" FontStyle="Italic" Margin="10,30,0,30"
+                                                   HorizontalAlignment="Center"
+                                                   Visibility="{Binding HasNoSelectedPersonPhotos, Converter={StaticResource BoolToVisConverter}}"/>
 
-                                                        <!-- Имя файла -->
-                                                        <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" FontSize="11" Foreground="#FFFFFF" 
-                                                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding RelativePath}" Margin="0,0,0,2"/>
+                                        <ItemsControl ItemsSource="{Binding SelectedPersonPhotos}">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <WrapPanel Orientation="Horizontal"/>
+                                                </ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <Border Background="#313244" CornerRadius="6" Padding="6" Margin="0,0,10,10" Width="150">
+                                                        <StackPanel>
+                                                            <!-- Миниатюра фотографии -->
+                                                            <Border CornerRadius="4" ClipToBounds="True" Height="110" Background="#11111B" Margin="0,0,0,6">
+                                                                <Image Source="{Binding ThumbnailPath}" Stretch="UniformToFill"/>
+                                                            </Border>
 
-                                                        <!-- Дата -->
-                                                        <TextBlock Text="{Binding FileCreatedAt, StringFormat='{}{0:dd.MM.yyyy}'}" FontSize="10" Foreground="#A6ADC8" Margin="0,0,0,6"/>
+                                                            <!-- Имя файла -->
+                                                            <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" FontSize="11" Foreground="#FFFFFF" 
+                                                                       TextTrimming="CharacterEllipsis" ToolTip="{Binding RelativePath}" Margin="0,0,0,2"/>
 
-                                                        <!-- Кнопка Отвязать с миниатюры -->
-                                                        <Button Content="❌ Отвязать" 
-                                                                Command="{Binding DataContext.UnassignPhotoFromPersonCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
-                                                                CommandParameter="{Binding}"
-                                                                Padding="6,3" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" FontSize="11"
-                                                                ToolTip="Убрать эту фотографию из альбома"/>
-                                                    </StackPanel>
-                                                </Border>
-                                            </DataTemplate>
-                                        </ItemsControl.ItemTemplate>
-                                    </ItemsControl>
+                                                            <!-- Дата -->
+                                                            <TextBlock Text="{Binding FileCreatedAt, StringFormat='{}{0:dd.MM.yyyy}'}" FontSize="10" Foreground="#A6ADC8" Margin="0,0,0,6"/>
+
+                                                            <!-- Кнопка Отвязать с миниатюры -->
+                                                            <Button Content="❌ Отвязать" 
+                                                                    Command="{Binding DataContext.UnassignPhotoFromPersonCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                                    CommandParameter="{Binding}"
+                                                                    Padding="6,3" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" FontSize="11"
+                                                                    ToolTip="Убрать эту фотографию из альбома"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <!-- Нижняя панель догрузки фото -->
+                                        <Border Margin="0,15,0,20" Padding="14,10" Background="#181825" CornerRadius="8" HorizontalAlignment="Center"
+                                                Visibility="{Binding CanLoadMorePersonPhotos, Converter={StaticResource BoolToVisConverter}}">
+                                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                <TextBlock VerticalAlignment="Center" Margin="0,0,15,0" Foreground="#CDD6F4" FontSize="13">
+                                                    <Run Text="Показано "/>
+                                                    <Run Text="{Binding SelectedPersonPhotos.Count, Mode=OneWay}" FontWeight="Bold" Foreground="#FFFFFF"/>
+                                                    <Run Text=" из "/>
+                                                    <Run Text="{Binding SelectedPerson.PhotosCount, Mode=OneWay}" FontWeight="Bold" Foreground="#A6E3A1"/>
+                                                    <Run Text=" фото этого человека"/>
+                                                </TextBlock>
+                                                <Button Content="➕ Загрузить еще 50 фото" 
+                                                        Command="{Binding LoadMorePersonPhotosCommand}"
+                                                        Padding="12,6" Background="#89B4FA" Foreground="#11111B" FontWeight="Bold" FontSize="12"
+                                                        Margin="0,0,8,0"
+                                                        ToolTip="Загрузить следующие 50 фотографий"/>
+                                                <Button Content="⏩ Загрузить еще 200 фото" 
+                                                        Command="{Binding LoadManyMorePersonPhotosCommand}"
+                                                        Padding="12,6" Background="#CBA6F7" Foreground="#11111B" FontWeight="Bold" FontSize="12"
+                                                        ToolTip="Загрузить следующие 200 фотографий"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Индикатор загрузки фото -->
+                                        <ProgressBar IsIndeterminate="True" Height="4" Margin="30,10,30,10"
+                                                     Visibility="{Binding IsLoadingPersonPhotos, Converter={StaticResource BoolToVisConverter}}"
+                                                     Foreground="#89B4FA" Background="#11111B"/>
+                                    </StackPanel>
                                 </ScrollViewer>
                             </Grid>
                         </Border>
