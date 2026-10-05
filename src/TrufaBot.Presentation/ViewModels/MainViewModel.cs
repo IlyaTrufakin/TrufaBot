@@ -1243,9 +1243,19 @@ public partial class MainViewModel : ObservableObject
 
         int count = await _faceService.RecomputeAllEmbeddingsAsync(progress);
         StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
-        FaceIndexingStatusText = $"Готово! Обновлено {count} нейросетевых отпечатков.";
-        _auditLogger.Log("Info", "Faces", $"Обновлено {count} нейросетевых отпечатков SFace.");
-        System.Windows.MessageBox.Show($"Успешно обновлено {count} нейросетевых отпечатков SFace! Теперь нейросеть готова к точному распознаванию.", "Нейросеть SFace", MessageBoxButton.OK, MessageBoxImage.Information);
+
+        if (count > 0)
+        {
+            FaceIndexingStatusText = $"Готово! Обновлено {count} нейросетевых отпечатков.";
+            _auditLogger.Log("Info", "Faces", $"Обновлено {count} нейросетевых отпечатков SFace.");
+            System.Windows.MessageBox.Show($"Успешно обновлено {count} нейросетевых отпечатков на модель SFace! Теперь нейросеть готова к точному распознаванию.", "Нейросеть SFace", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        else
+        {
+            FaceIndexingStatusText = "Все нейросетевые отпечатки лиц SFace уже актуальны.";
+            _auditLogger.Log("Info", "Faces", "Все нейросетевые отпечатки лиц SFace уже актуальны.");
+            System.Windows.MessageBox.Show($"Все найденные лица в базе ({TotalKnownFacesCount} лиц) уже имеют вычисленные нейросетевые отпечатки SFace и находятся в 100% актуальном состоянии!\n\nУстаревших или пустых отпечатков не обнаружено — повторный пересчёт не требуется.", "Нейросеть SFace", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
     }
 
     [RelayCommand]

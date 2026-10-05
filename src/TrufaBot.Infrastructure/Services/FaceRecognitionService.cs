@@ -678,7 +678,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         var faces = await db.PersonFaces
             .Include(f => f.MediaItem)
             .ThenInclude(m => m.StorageSource)
-            .Where(f => !f.IsIgnored && !f.IsFalsePositive)
+            .Where(f => !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
             .ToListAsync(ct);
 
         int total = faces.Count;
