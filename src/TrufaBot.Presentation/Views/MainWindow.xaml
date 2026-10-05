@@ -834,6 +834,13 @@
                                                 Padding="8,3" Margin="14,0,0,0"
                                                 Background="#313244" Foreground="#89B4FA" FontWeight="Bold" FontSize="11"
                                                 ToolTip="Подгрузить следующие 50 фотографий в галерею"/>
+
+                                        <!-- Переключатель глобального режима: Фото целиком vs Лица крупно -->
+                                        <Button Content="{Binding AlbumViewModeText}" 
+                                                Command="{Binding ToggleAlbumViewModeCommand}"
+                                                Padding="10,3" Margin="8,0,0,0"
+                                                Background="#313244" Foreground="#F9E2AF" FontWeight="Bold" FontSize="11"
+                                                ToolTip="Переключить показ между полными фотографиями и вырезанными лицами крупным планом для быстрой проверки"/>
                                     </StackPanel>
 
                                     <TextBlock Grid.Column="1" Text="💡 Кликните «❌ Отвязать» на карточке фото, чтобы убрать его из альбома" 
@@ -856,11 +863,57 @@
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate>
-                                                    <Border Background="#313244" CornerRadius="6" Padding="6" Margin="0,0,10,10" Width="150">
+                                                    <Border Background="#313244" CornerRadius="6" Padding="6" Margin="0,0,10,10" Width="155">
                                                         <StackPanel>
-                                                            <!-- Миниатюра фотографии -->
-                                                            <Border CornerRadius="4" ClipToBounds="True" Height="110" Background="#11111B" Margin="0,0,0,6">
-                                                                <Image Source="{Binding ThumbnailPath}" Stretch="UniformToFill"/>
+                                                            <!-- Контейнер изображения (БЕЗ ОБРЕЗКИ: Stretch=Uniform) -->
+                                                            <Border CornerRadius="4" ClipToBounds="True" Height="115" Background="#11111B" Margin="0,0,0,6">
+                                                                <Grid>
+                                                                    <!-- Основное изображение: Stretch="Uniform" гарантирует, что фото ВСЕГДА видно целиком! -->
+                                                                    <Image Source="{Binding DisplayThumbnailPath}" Stretch="Uniform" 
+                                                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                           ToolTip="Дважды кликните, чтобы открыть оригинал фото">
+                                                                        <Image.InputBindings>
+                                                                            <MouseBinding Gesture="LeftDoubleClick" 
+                                                                                          Command="{Binding DataContext.OpenFullPhotoCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                                                          CommandParameter="{Binding}"/>
+                                                                        </Image.InputBindings>
+                                                                    </Image>
+
+                                                                    <!-- Круглый аватар распознанного лица в правом нижнем углу (когда отображается полное фото) -->
+                                                                    <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="4"
+                                                                            Width="38" Height="38" CornerRadius="19" BorderBrush="#89B4FA" BorderThickness="2"
+                                                                            Background="#11111B" ClipToBounds="True"
+                                                                            Cursor="Hand"
+                                                                            ToolTip="Распознанное лицо человека на этом фото. Кликните, чтобы показать крупно!">
+                                                                        <Border.Style>
+                                                                            <Style TargetType="Border">
+                                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                                                <Style.Triggers>
+                                                                                    <DataTrigger Binding="{Binding IsShowingFaceCrop}" Value="True">
+                                                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                                                    </DataTrigger>
+                                                                                    <DataTrigger Binding="{Binding HasFaceCrop}" Value="False">
+                                                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                                                    </DataTrigger>
+                                                                                </Style.Triggers>
+                                                                            </Style>
+                                                                        </Border.Style>
+                                                                        <Border.InputBindings>
+                                                                            <MouseBinding Gesture="LeftClick" 
+                                                                                          Command="{Binding DataContext.TogglePhotoViewModeCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                                                          CommandParameter="{Binding}"/>
+                                                                        </Border.InputBindings>
+                                                                        <Image Source="{Binding FaceCropThumbnailPath}" Stretch="UniformToFill"/>
+                                                                    </Border>
+
+                                                                    <!-- Значок 'Лицо' в левом верхнем углу, если сейчас включен крупный план лица -->
+                                                                    <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="4"
+                                                                            Background="#89B4FA" CornerRadius="3" Padding="4,1"
+                                                                            Visibility="{Binding IsShowingFaceCrop, Converter={StaticResource BoolToVisConverter}}"
+                                                                            ToolTip="Сейчас показано вырезанное лицо. Кликните переключатель внизу, чтобы увидеть всё фото.">
+                                                                        <TextBlock Text="👤 Лицо" FontSize="9" FontWeight="Bold" Foreground="#11111B"/>
+                                                                    </Border>
+                                                                </Grid>
                                                             </Border>
 
                                                             <!-- Имя файла -->
@@ -868,14 +921,28 @@
                                                                        TextTrimming="CharacterEllipsis" ToolTip="{Binding RelativePath}" Margin="0,0,0,2"/>
 
                                                             <!-- Дата -->
-                                                            <TextBlock Text="{Binding FileCreatedAt, StringFormat='{}{0:dd.MM.yyyy}'}" FontSize="10" Foreground="#A6ADC8" Margin="0,0,0,6"/>
+                                                            <TextBlock Text="{Binding FileCreatedAt, StringFormat='{}{0:dd.MM.yyyy}'}" FontSize="10" Foreground="#A6ADC8" Margin="0,0,0,5"/>
 
-                                                            <!-- Кнопка Отвязать с миниатюры -->
-                                                            <Button Content="❌ Отвязать" 
-                                                                    Command="{Binding DataContext.UnassignPhotoFromPersonCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
-                                                                    CommandParameter="{Binding}"
-                                                                    Padding="6,3" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" FontSize="11"
-                                                                    ToolTip="Убрать эту фотографию из альбома"/>
+                                                            <!-- Кнопки управления карточкой: Отвязать и Переключить вид (Фото/Лицо) -->
+                                                            <Grid>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="*"/>
+                                                                    <ColumnDefinition Width="4"/>
+                                                                    <ColumnDefinition Width="32"/>
+                                                                </Grid.ColumnDefinitions>
+
+                                                                <Button Grid.Column="0" Content="❌ Отвязать" 
+                                                                        Command="{Binding DataContext.UnassignPhotoFromPersonCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                                        CommandParameter="{Binding}"
+                                                                        Padding="4,3" Background="#F38BA8" Foreground="#11111B" FontWeight="Bold" FontSize="11"
+                                                                        ToolTip="Убрать эту фотографию из альбома"/>
+
+                                                                <Button Grid.Column="2" Content="{Binding ToggleViewIcon}" 
+                                                                        Command="{Binding DataContext.TogglePhotoViewModeCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                                        CommandParameter="{Binding}"
+                                                                        Padding="0,3" Background="#313244" Foreground="#89B4FA" FontWeight="Bold" FontSize="12"
+                                                                        ToolTip="{Binding ToggleViewTooltip}"/>
+                                                            </Grid>
                                                         </StackPanel>
                                                     </Border>
                                                 </DataTemplate>

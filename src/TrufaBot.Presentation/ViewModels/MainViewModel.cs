@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 using System.Windows;
@@ -196,12 +197,34 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
 public partial class PersonPhotoItemViewModel : ObservableObject
 {
     public long MediaItemId { get; set; }
+    public long FaceId { get; set; }
     public string FileName { get; set; } = "";
     public string RelativePath { get; set; } = "";
     public string FullImagePath { get; set; } = "";
     
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(DisplayThumbnailPath))]
     private string _thumbnailPath = "";
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(DisplayThumbnailPath))]
+    [NotifyPropertyChangedFor(nameof(HasFaceCrop))]
+    private string _faceCropThumbnailPath = "";
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(DisplayThumbnailPath))]
+    [NotifyPropertyChangedFor(nameof(ToggleViewIcon))]
+    [NotifyPropertyChangedFor(nameof(ToggleViewTooltip))]
+    private bool _isShowingFaceCrop;
+
+    public bool HasFaceCrop => !string.IsNullOrEmpty(FaceCropThumbnailPath);
+
+    public string DisplayThumbnailPath => (IsShowingFaceCrop && HasFaceCrop)
+        ? FaceCropThumbnailPath
+        : ThumbnailPath;
+
+    public string ToggleViewIcon => IsShowingFaceCrop ? "🖼" : "👤";
+    public string ToggleViewTooltip => IsShowingFaceCrop ? "Показать всю фотографию целиком" : "Показать найденное лицо крупным планом";
 
     public string? AIDescription { get; set; }
     public DateTime FileCreatedAt { get; set; }
@@ -403,6 +426,12 @@ public partial class MainViewModel : ObservableObject
         !IsLoadingPersonPhotos &&
         SelectedPerson != null &&
         SelectedPersonPhotos.Count == 0;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(AlbumViewModeText))]
+    private bool _isAlbumFaceModeEnabled;
+
+    public string AlbumViewModeText => IsAlbumFaceModeEnabled ? "👤 Вид: Лица крупно" : "🖼 Вид: Фото целиком";
 
     public MainViewModel(
         IAuditLogger auditLogger, 
@@ -1054,6 +1083,37 @@ public partial class MainViewModel : ObservableObject
         await LoadPersonPhotosBatchAsync(personId, skip: currentCount, take: 200, append: true);
     }
 
+    [RelayCommand]
+    private void ToggleAlbumViewMode()
+    {
+        IsAlbumFaceModeEnabled = !IsAlbumFaceModeEnabled;
+        foreach (var p in SelectedPersonPhotos)
+        {
+            p.IsShowingFaceCrop = IsAlbumFaceModeEnabled;
+        }
+    }
+
+    [RelayCommand]
+    private void TogglePhotoViewMode(PersonPhotoItemViewModel? item)
+    {
+        if (item == null) return;
+        item.IsShowingFaceCrop = !item.IsShowingFaceCrop;
+    }
+
+    [RelayCommand]
+    private void OpenFullPhoto(PersonPhotoItemViewModel? item)
+    {
+        if (item == null || string.IsNullOrEmpty(item.FullImagePath) || !File.Exists(item.FullImagePath)) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(item.FullImagePath) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Не удалось открыть фото: {ex.Message}");
+        }
+    }
+
     private async Task LoadPersonPhotosBatchAsync(int personId, int skip, int take, bool append)
     {
         if (IsLoadingPersonPhotos) return;
@@ -1076,6 +1136,12 @@ public partial class MainViewModel : ObservableObject
                 .Take(take)
                 .ToListAsync();
 
+            var mediaItemIds = photos.Select(p => p.Id).ToList();
+            var faces = await db.PersonFaces
+                .Where(f => f.PersonId == personId && !f.IsIgnored && !f.IsFalsePositive && mediaItemIds.Contains(f.MediaItemId))
+                .ToListAsync();
+            var faceByMediaId = faces.GroupBy(f => f.MediaItemId).ToDictionary(g => g.Key, g => g.First());
+
             var viewModels = new List<PersonPhotoItemViewModel>();
 
             foreach (var photo in photos)
@@ -1083,13 +1149,23 @@ public partial class MainViewModel : ObservableObject
                 var fullPath = Path.Combine(photo.StorageSource.RootPath, photo.RelativePath.Replace('/', '\\'));
                 var thumb = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 240, 240);
 
+                faceByMediaId.TryGetValue(photo.Id, out var face);
+                string faceCrop = "";
+                if (face != null && File.Exists(fullPath))
+                {
+                    faceCrop = await _faceService.GetOrCreateFaceCropThumbnailAsync(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight, face.Id);
+                }
+
                 viewModels.Add(new PersonPhotoItemViewModel
                 {
                     MediaItemId = photo.Id,
+                    FaceId = face?.Id ?? 0,
                     FileName = photo.FileName,
                     RelativePath = photo.RelativePath,
                     FullImagePath = fullPath,
                     ThumbnailPath = thumb,
+                    FaceCropThumbnailPath = faceCrop,
+                    IsShowingFaceCrop = IsAlbumFaceModeEnabled,
                     AIDescription = photo.AIDescription,
                     FileCreatedAt = photo.FileCreatedAt
                 });
