@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -181,10 +181,14 @@ public class FaceRecognitionService : IFaceRecognitionService
                 float bw = b.X2 - b.X1;
                 float bh = b.Y2 - b.Y1;
 
-                int cropX = Math.Max(0, (int)(b.X1 * origW));
-                int cropY = Math.Max(0, (int)(b.Y1 * origH));
-                int cropW = Math.Min(origW - cropX, (int)(bw * origW));
-                int cropH = Math.Min(origH - cropY, (int)(bh * origH));
+                // Добавляем 20% запаса вокруг лица для захвата формы головы, подбородка и прически
+                float marginX = bw * 0.20f;
+                float marginY = bh * 0.20f;
+
+                int cropX = Math.Max(0, (int)((b.X1 - marginX) * origW));
+                int cropY = Math.Max(0, (int)((b.Y1 - marginY) * origH));
+                int cropW = Math.Min(origW - cropX, (int)((bw + marginX * 2) * origW));
+                int cropH = Math.Min(origH - cropY, (int)((bh + marginY * 2) * origH));
 
                 if (cropW < 20 || cropH < 20) continue;
 
@@ -194,17 +198,20 @@ public class FaceRecognitionService : IFaceRecognitionService
                 {
                     // Вычисляем глубокий вектор лица через нейросеть SFace
                     var embedding = ComputeDeepSFaceEmbedding(faceBitmap);
-                    list.Add(new DetectedFaceResult
+                    if (embedding.Length == EmbeddingSize)
                     {
-                        BoxX = b.X1,
-                        BoxY = b.Y1,
-                        BoxWidth = bw,
-                        BoxHeight = bh,
-                        Confidence = b.Score,
-                        Embedding = embedding,
-                        MatchedPersonId = null,
-                        MatchedPersonName = null
-                    });
+                        list.Add(new DetectedFaceResult
+                        {
+                            BoxX = b.X1,
+                            BoxY = b.Y1,
+                            BoxWidth = bw,
+                            BoxHeight = bh,
+                            Confidence = b.Score,
+                            Embedding = embedding,
+                            MatchedPersonId = null,
+                            MatchedPersonName = null
+                        });
+                    }
                 }
             }
         }
@@ -212,36 +219,35 @@ public class FaceRecognitionService : IFaceRecognitionService
         return list;
     }
 
-    private float[] ComputeDeepSFaceEmbedding(SKBitmap faceBitmap)
+    public float[] ComputeDeepSFaceEmbedding(SKBitmap faceBitmap)
     {
         lock (_lock)
         {
             if (_embeddingSession == null)
             {
                 InitializeSessions();
-                if (_embeddingSession == null)
-                {
-                    return ComputeFallbackVector(faceBitmap, EmbeddingSize);
-                }
+                if (_embeddingSession == null) return Array.Empty<float>();
             }
 
             try
             {
                 const int sfaceSize = 112;
                 using var resized = faceBitmap.Resize(new SKImageInfo(sfaceSize, sfaceSize, SKColorType.Rgb888x), SKFilterQuality.High);
-                if (resized == null) return ComputeFallbackVector(faceBitmap, EmbeddingSize);
+                if (resized == null) return Array.Empty<float>();
 
-                var inputTensor = new DenseTensor<float>(new[] { 1, 112, 112, 3 });
+                // SFace ожидает NCHW тензор: [1, 3, 112, 112], RGB, значения 0..255
+                var inputTensor = new DenseTensor<float>(new[] { 1, 3, sfaceSize, sfaceSize });
                 var pixels = resized.Pixels;
 
                 for (int y = 0; y < sfaceSize; y++)
                 {
+                    int rowOffset = y * sfaceSize;
                     for (int x = 0; x < sfaceSize; x++)
                     {
-                        var pixel = pixels[y * sfaceSize + x];
-                        inputTensor[0, y, x, 0] = pixel.Red;
-                        inputTensor[0, y, x, 1] = pixel.Green;
-                        inputTensor[0, y, x, 2] = pixel.Blue;
+                        var pixel = pixels[rowOffset + x];
+                        inputTensor[0, 0, y, x] = pixel.Red;
+                        inputTensor[0, 1, y, x] = pixel.Green;
+                        inputTensor[0, 2, y, x] = pixel.Blue;
                     }
                 }
 
@@ -260,7 +266,7 @@ public class FaceRecognitionService : IFaceRecognitionService
                     embedding[i] = outputTensor.GetValue(i);
                 }
 
-                // L2 Нормализация
+                // L2 Нормализация для точного косинусного сходства
                 double norm = 0;
                 for (int i = 0; i < embedding.Length; i++) norm += embedding[i] * embedding[i];
                 norm = Math.Sqrt(norm);
@@ -271,37 +277,57 @@ public class FaceRecognitionService : IFaceRecognitionService
 
                 return embedding;
             }
-            catch
+            catch (Exception ex)
             {
-                return ComputeFallbackVector(faceBitmap, EmbeddingSize);
+                System.Diagnostics.Debug.WriteLine($"[SFace ONNX Error]: {ex.Message}");
+                return Array.Empty<float>();
             }
         }
     }
 
-    private float[] ComputeFallbackVector(SKBitmap faceBitmap, int vectorLength)
+    public float[] ExtractSFaceEmbeddingFromImage(string imagePath, float boxX, float boxY, float boxW, float boxH)
     {
-        using var resized = faceBitmap.Resize(new SKImageInfo(32, 32, SKColorType.Gray8), SKFilterQuality.Medium);
-        var source = resized ?? faceBitmap;
+        if (!File.Exists(imagePath)) return Array.Empty<float>();
 
-        var vector = new float[vectorLength];
-        var pixels = source.GetPixelSpan();
-        int step = pixels.Length / vectorLength;
-        if (step < 1) step = 1;
-
-        for (int i = 0; i < vectorLength && (i * step) < pixels.Length; i++)
+        try
         {
-            vector[i] = pixels[i * step];
-        }
+            using var codec = SKCodec.Create(imagePath);
+            if (codec == null) return Array.Empty<float>();
 
-        double norm = 0;
-        for (int i = 0; i < vector.Length; i++) norm += vector[i] * vector[i];
-        norm = Math.Sqrt(norm);
-        if (norm > 0)
+            using var originalBitmap = SKBitmap.Decode(codec);
+            if (originalBitmap == null) return Array.Empty<float>();
+
+            int origW = originalBitmap.Width;
+            int origH = originalBitmap.Height;
+
+            float marginX = boxW * 0.20f;
+            float marginY = boxH * 0.20f;
+
+            int cropX = Math.Max(0, (int)((boxX - marginX) * origW));
+            int cropY = Math.Max(0, (int)((boxY - marginY) * origH));
+            int cropW = Math.Min(origW - cropX, (int)((boxW + marginX * 2) * origW));
+            int cropH = Math.Min(origH - cropY, (int)((boxH + marginY * 2) * origH));
+
+            if (cropW < 20 || cropH < 20) return Array.Empty<float>();
+
+            var rect = new SKRectI(cropX, cropY, cropX + cropW, cropY + cropH);
+            using var faceBitmap = new SKBitmap();
+            if (!originalBitmap.ExtractSubset(faceBitmap, rect)) return Array.Empty<float>();
+
+            return ComputeDeepSFaceEmbedding(faceBitmap);
+        }
+        catch
         {
-            for (int i = 0; i < vector.Length; i++) vector[i] = (float)(vector[i] / norm);
+            return Array.Empty<float>();
         }
+    }
 
-        return vector;
+    public static bool IsLegacyDummyEmbedding(float[]? embedding)
+    {
+        if (embedding == null || embedding.Length != EmbeddingSize) return true;
+        // Настоящие векторы SFace центрированы вокруг 0 (примерно 50% значений отрицательные).
+        // В старом черновом векторе яркости все 128 чисел были строго положительными (>= 0).
+        return embedding.All(v => v >= 0);
     }
 
     private List<(float X1, float Y1, float X2, float Y2, float Score)> ApplyNMS(List<(float X1, float Y1, float X2, float Y2, float Score)> boxes, float iouThreshold)
@@ -360,8 +386,8 @@ public class FaceRecognitionService : IFaceRecognitionService
                 int imgW = originalBitmap.Width;
                 int imgH = originalBitmap.Height;
 
-                float marginX = boxW * 0.15f;
-                float marginY = boxH * 0.15f;
+                float marginX = boxW * 0.20f;
+                float marginY = boxH * 0.20f;
 
                 int x = Math.Max(0, (int)((boxX - marginX) * imgW));
                 int y = Math.Max(0, (int)((boxY - marginY) * imgH));
@@ -394,46 +420,130 @@ public class FaceRecognitionService : IFaceRecognitionService
     public async Task AssignFaceToPersonAsync(long faceId, int personId, CancellationToken ct = default)
     {
         using var db = new AppDbContext();
-        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
-        if (targetFace != null)
+        var targetFace = await db.PersonFaces
+            .Include(f => f.MediaItem)
+            .ThenInclude(m => m.StorageSource)
+            .FirstOrDefaultAsync(f => f.Id == faceId, ct);
+
+        if (targetFace == null) return;
+
+        var person = await db.People.FindAsync(new object[] { personId }, ct);
+        if (person == null) return;
+
+        targetFace.PersonId = personId;
+        targetFace.IsIgnored = false;
+
+        // Если у этого лица был старый черновой вектор, вычисляем настоящий глубокий отпечаток SFace
+        var curVec = DecodeEmbedding(targetFace.Embedding ?? "");
+        if (IsLegacyDummyEmbedding(curVec))
         {
-            targetFace.PersonId = personId;
-            targetFace.IsIgnored = false;
-            await db.SaveChangesAsync(ct);
+            var fullPath = Path.Combine(targetFace.MediaItem.StorageSource.RootPath, targetFace.MediaItem.RelativePath.Replace('/', '\\'));
+            var newEmb = ExtractSFaceEmbeddingFromImage(fullPath, targetFace.BoxX, targetFace.BoxY, targetFace.BoxWidth, targetFace.BoxHeight);
+            if (newEmb.Length == EmbeddingSize)
+            {
+                targetFace.Embedding = EncodeEmbedding(newEmb);
+            }
         }
+
+        // Добавляем имя человека в AITags фотографии!
+        if (targetFace.MediaItem != null)
+        {
+            AddPersonNameToMediaTags(targetFace.MediaItem, person.Name);
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task UnassignPhotoFromPersonAsync(long mediaItemId, int personId, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var item = await db.MediaItems
+            .Include(m => m.Faces)
+            .FirstOrDefaultAsync(m => m.Id == mediaItemId, ct);
+
+        if (item == null) return;
+
+        var person = await db.People.FindAsync(new object[] { personId }, ct);
+
+        foreach (var face in item.Faces.Where(f => f.PersonId == personId))
+        {
+            face.PersonId = null;
+        }
+
+        // Удаляем имя человека из тегов, если у него больше нет привязанных лиц на этом фото
+        if (person != null && !item.Faces.Any(f => f.PersonId == personId))
+        {
+            RemovePersonNameFromMediaTags(item, person.Name);
+        }
+
+        await db.SaveChangesAsync(ct);
     }
 
     /// <summary>
-    /// Автоматическое глубокое распознавание по всему архиву на основе размеченных эталонных лиц людей
+    /// Автоматическое глубокое распознавание (Few-Shot Multi-Prototype Learning):
+    /// Обучается на примерах лиц, размеченных пользователем, и находит всех этих людей по всему архиву.
+    /// Имена распознанных людей автоматически добавляются в теги (AITags) фотографий.
     /// </summary>
-    public async Task<int> AutoMatchAllKnownPeopleAsync(float threshold = 0.42f, CancellationToken ct = default)
+    public async Task<int> AutoMatchAllKnownPeopleAsync(float threshold = 0.38f, CancellationToken ct = default)
     {
         using var db = new AppDbContext();
 
-        // Загружаем все эталонные лица добавленных людей
+        // 1. Загружаем всех людей
+        var people = await db.People.ToListAsync(ct);
+        if (!people.Any()) return 0;
+        var personMap = people.ToDictionary(p => p.Id, p => p.Name);
+
+        // 2. Загружаем все эталонные лица, подтвержденные пользователем
         var knownFaces = await db.PersonFaces
+            .Include(f => f.MediaItem)
+            .ThenInclude(m => m.StorageSource)
             .Where(f => f.PersonId != null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
             .ToListAsync(ct);
 
         if (!knownFaces.Any()) return 0;
 
-        // Группируем эталоны по каждому человеку
-        var personVectors = new Dictionary<int, List<float[]>>();
+        // Если среди эталонов есть старые черновые векторы, пересчитываем их через SFace прямо сейчас
+        bool anyRefUpdated = false;
+        foreach (var kf in knownFaces)
+        {
+            var v = DecodeEmbedding(kf.Embedding!);
+            if (IsLegacyDummyEmbedding(v) && kf.MediaItem != null && kf.MediaItem.StorageSource != null)
+            {
+                var fullPath = Path.Combine(kf.MediaItem.StorageSource.RootPath, kf.MediaItem.RelativePath.Replace('/', '\\'));
+                var newEmb = ExtractSFaceEmbeddingFromImage(fullPath, kf.BoxX, kf.BoxY, kf.BoxWidth, kf.BoxHeight);
+                if (newEmb.Length == EmbeddingSize)
+                {
+                    kf.Embedding = EncodeEmbedding(newEmb);
+                    anyRefUpdated = true;
+                }
+            }
+        }
+        if (anyRefUpdated)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        // 3. Формируем базу прототипов (Multi-Prototype Prototype Memory) для каждого человека
+        var personPrototypes = new Dictionary<int, List<float[]>>();
         foreach (var face in knownFaces)
         {
             var vec = DecodeEmbedding(face.Embedding!);
-            if (vec != null)
+            if (vec != null && !IsLegacyDummyEmbedding(vec))
             {
-                if (!personVectors.ContainsKey(face.PersonId!.Value))
+                if (!personPrototypes.ContainsKey(face.PersonId!.Value))
                 {
-                    personVectors[face.PersonId!.Value] = new List<float[]>();
+                    personPrototypes[face.PersonId!.Value] = new List<float[]>();
                 }
-                personVectors[face.PersonId!.Value].Add(vec);
+                personPrototypes[face.PersonId!.Value].Add(vec);
             }
         }
 
-        // Загружаем все неразмеченные лица из архива
+        if (!personPrototypes.Any()) return 0;
+
+        // 4. Загружаем неразмеченные лица
         var unassignedFaces = await db.PersonFaces
+            .Include(f => f.MediaItem)
+            .ThenInclude(m => m.StorageSource)
             .Where(f => f.PersonId == null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
             .ToListAsync(ct);
 
@@ -441,31 +551,69 @@ public class FaceRecognitionService : IFaceRecognitionService
 
         foreach (var unassigned in unassignedFaces)
         {
+            if (ct.IsCancellationRequested) break;
+
             var unassignedVec = DecodeEmbedding(unassigned.Embedding!);
-            if (unassignedVec == null) continue;
 
-            int? bestPersonId = null;
-            double bestSim = 0;
-
-            foreach (var (personId, vectors) in personVectors)
+            // Если неразмеченное лицо имеет старый вектор, обновляем через SFace
+            if (IsLegacyDummyEmbedding(unassignedVec) && unassigned.MediaItem != null && unassigned.MediaItem.StorageSource != null)
             {
-                foreach (var refVec in vectors)
+                var fullPath = Path.Combine(unassigned.MediaItem.StorageSource.RootPath, unassigned.MediaItem.RelativePath.Replace('/', '\\'));
+                var newEmb = ExtractSFaceEmbeddingFromImage(fullPath, unassigned.BoxX, unassigned.BoxY, unassigned.BoxWidth, unassigned.BoxHeight);
+                if (newEmb.Length == EmbeddingSize)
                 {
-                    if (refVec.Length != unassignedVec.Length) continue;
-
-                    var sim = CalculateCosineSimilarity(unassignedVec, refVec);
-                    if (sim > bestSim && sim >= threshold)
-                    {
-                        bestSim = sim;
-                        bestPersonId = personId;
-                    }
+                    unassigned.Embedding = EncodeEmbedding(newEmb);
+                    unassignedVec = newEmb;
+                }
+                else
+                {
+                    continue;
                 }
             }
 
-            if (bestPersonId.HasValue)
+            if (unassignedVec == null || IsLegacyDummyEmbedding(unassignedVec)) continue;
+
+            int? bestPersonId = null;
+            double bestSim = 0.0;
+            double secondBestSim = 0.0;
+
+            foreach (var (personId, prototypes) in personPrototypes)
             {
-                unassigned.PersonId = bestPersonId.Value;
-                matchedCount++;
+                // Максимальное сходство с любым из подтвержденных образцов этого человека (KNN k=1 prototype)
+                double maxPersonSim = 0.0;
+                foreach (var refVec in prototypes)
+                {
+                    double sim = CalculateCosineSimilarity(unassignedVec, refVec);
+                    if (sim > maxPersonSim) maxPersonSim = sim;
+                }
+
+                if (maxPersonSim > bestSim)
+                {
+                    secondBestSim = bestSim;
+                    bestSim = maxPersonSim;
+                    bestPersonId = personId;
+                }
+                else if (maxPersonSim > secondBestSim)
+                {
+                    secondBestSim = maxPersonSim;
+                }
+            }
+
+            // Порог уверенности: не менее threshold (0.38) и с запасом от других людей
+            if (bestPersonId.HasValue && bestSim >= threshold)
+            {
+                // Если есть второй кандидат, требуем отрыв минимум 0.03 либо очень высокое совпадение (> 0.45)
+                if (secondBestSim == 0.0 || (bestSim - secondBestSim) >= 0.03 || bestSim >= 0.45)
+                {
+                    unassigned.PersonId = bestPersonId.Value;
+                    matchedCount++;
+
+                    // Автоматически добавляем имя распознанного человека в теги фото (AITags)!
+                    if (unassigned.MediaItem != null && personMap.TryGetValue(bestPersonId.Value, out var pName))
+                    {
+                        AddPersonNameToMediaTags(unassigned.MediaItem, pName);
+                    }
+                }
             }
         }
 
@@ -475,6 +623,101 @@ public class FaceRecognitionService : IFaceRecognitionService
         }
 
         return matchedCount;
+    }
+
+    /// <summary>
+    /// Синхронизирует имена всех распознанных людей в теги (AITags) всех фотографий
+    /// </summary>
+    public async Task<int> SyncPersonNamesToMediaTagsAsync(CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+
+        var itemsWithPeople = await db.MediaItems
+            .Include(m => m.Faces)
+            .ThenInclude(f => f.Person)
+            .Where(m => m.Faces.Any(f => f.PersonId != null && !f.IsIgnored))
+            .ToListAsync(ct);
+
+        int updatedCount = 0;
+
+        foreach (var item in itemsWithPeople)
+        {
+            var personNames = item.Faces
+                .Where(f => f.Person != null && !f.IsIgnored)
+                .Select(f => f.Person!.Name)
+                .Distinct()
+                .ToList();
+
+            string before = item.AITags ?? "";
+            foreach (var name in personNames)
+            {
+                AddPersonNameToMediaTags(item, name);
+            }
+            if (before != (item.AITags ?? ""))
+            {
+                updatedCount++;
+            }
+        }
+
+        if (updatedCount > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        return updatedCount;
+    }
+
+    /// <summary>
+    /// Пересчитывает нейросетевые отпечатки SFace для всех найденных лиц в архиве
+    /// </summary>
+    public async Task<int> RecomputeAllEmbeddingsAsync(IProgress<(int processed, int total)>? progress = null, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+
+        var faces = await db.PersonFaces
+            .Include(f => f.MediaItem)
+            .ThenInclude(m => m.StorageSource)
+            .Where(f => !f.IsIgnored)
+            .ToListAsync(ct);
+
+        int total = faces.Count;
+        int updated = 0;
+        int processed = 0;
+
+        for (int i = 0; i < faces.Count; i++)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            var face = faces[i];
+            var curVec = DecodeEmbedding(face.Embedding ?? "");
+
+            // Пересчитываем только если это старый черновой вектор или пустой
+            if (IsLegacyDummyEmbedding(curVec) && face.MediaItem != null && face.MediaItem.StorageSource != null)
+            {
+                var fullPath = Path.Combine(face.MediaItem.StorageSource.RootPath, face.MediaItem.RelativePath.Replace('/', '\\'));
+                var newEmb = ExtractSFaceEmbeddingFromImage(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight);
+                if (newEmb.Length == EmbeddingSize)
+                {
+                    face.Embedding = EncodeEmbedding(newEmb);
+                    updated++;
+                }
+            }
+
+            processed++;
+            if (processed % 50 == 0)
+            {
+                await db.SaveChangesAsync(ct);
+                progress?.Report((processed, total));
+            }
+        }
+
+        if (updated > 0)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
+        progress?.Report((total, total));
+        return updated;
     }
 
     public async Task IgnoreFaceAsync(long faceId, CancellationToken ct = default)
@@ -530,23 +773,48 @@ public class FaceRecognitionService : IFaceRecognitionService
         catch { }
     }
 
+    public static void AddPersonNameToMediaTags(MediaItem item, string personName)
+    {
+        if (string.IsNullOrWhiteSpace(personName)) return;
+
+        var currentTags = (item.AITags ?? "")
+            .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim())
+            .Where(t => !string.IsNullOrEmpty(t))
+            .ToList();
+
+        if (!currentTags.Any(t => string.Equals(t, personName, StringComparison.OrdinalIgnoreCase)))
+        {
+            currentTags.Insert(0, personName);
+            item.AITags = string.Join(", ", currentTags);
+        }
+    }
+
+    public static void RemovePersonNameFromMediaTags(MediaItem item, string personName)
+    {
+        if (string.IsNullOrWhiteSpace(personName) || string.IsNullOrEmpty(item.AITags)) return;
+
+        var currentTags = item.AITags
+            .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim())
+            .Where(t => !string.IsNullOrEmpty(t))
+            .Where(t => !string.Equals(t, personName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        item.AITags = currentTags.Any() ? string.Join(", ", currentTags) : null;
+    }
+
     public static double CalculateCosineSimilarity(float[] emb1, float[] emb2)
     {
         if (emb1.Length != emb2.Length || emb1.Length == 0) return 0.0;
 
         double dot = 0.0;
-        double norm1 = 0.0;
-        double norm2 = 0.0;
-
         for (int i = 0; i < emb1.Length; i++)
         {
             dot += emb1[i] * emb2[i];
-            norm1 += emb1[i] * emb1[i];
-            norm2 += emb2[i] * emb2[i];
         }
 
-        if (norm1 <= 0 || norm2 <= 0) return 0.0;
-        return dot / (Math.Sqrt(norm1) * Math.Sqrt(norm2));
+        return dot;
     }
 
     public static string EncodeEmbedding(float[] embedding)

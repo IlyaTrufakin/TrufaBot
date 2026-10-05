@@ -1,4 +1,4 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Text.Json;
 using System.Windows;
@@ -40,6 +40,9 @@ public partial class PersonItemViewModel : ObservableObject
 
     [ObservableProperty]
     private int _photosCount;
+
+    [ObservableProperty]
+    private int _samplesCount;
 
     public DateTime CreatedAt { get; set; }
 }
@@ -436,6 +439,13 @@ public partial class MainViewModel : ObservableObject
                     .Select(g => new { PersonId = g.Key, Count = g.Select(x => x.MediaItemId).Distinct().Count() })
                     .ToDictionaryAsync(x => x.PersonId, x => x.Count);
 
+                // Считаем подтвержденные образцы лиц (обучающую выборку) для каждого человека
+                var sampleCounts = await db.PersonFaces
+                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .GroupBy(f => f.PersonId!.Value)
+                    .Select(g => new { PersonId = g.Key, Count = g.Count() })
+                    .ToDictionaryAsync(x => x.PersonId, x => x.Count);
+
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     TotalKnownFacesCount = totalFaces;
@@ -455,6 +465,7 @@ public partial class MainViewModel : ObservableObject
                     {
                         var fresh = peopleList[i];
                         int count = distinctCounts.GetValueOrDefault(fresh.Id, 0);
+                        int samples = sampleCounts.GetValueOrDefault(fresh.Id, 0);
 
                         var existing = People.FirstOrDefault(x => x.Id == fresh.Id);
                         if (existing != null)
@@ -463,6 +474,7 @@ public partial class MainViewModel : ObservableObject
                             existing.Category = fresh.Category;
                             existing.Notes = fresh.Notes;
                             existing.PhotosCount = count;
+                            existing.SamplesCount = samples;
                         }
                         else
                         {
@@ -473,6 +485,7 @@ public partial class MainViewModel : ObservableObject
                                 Category = fresh.Category,
                                 Notes = fresh.Notes,
                                 PhotosCount = count,
+                                SamplesCount = samples,
                                 CreatedAt = fresh.CreatedAt
                             };
                             People.Insert(i, vm);
@@ -601,16 +614,45 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task AutoMatchAllFacesAsync()
     {
-        StatusText = "⏳ Нейросеть распознает лица людей во всем архиве...";
-        int matched = await _faceService.AutoMatchAllKnownPeopleAsync(threshold: 0.42f);
+        StatusText = "⏳ Нейросеть обучается на ваших образцах и ищет людей по архиву...";
+        int matched = await _faceService.AutoMatchAllKnownPeopleAsync(threshold: 0.38f);
         StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
 
-        _auditLogger.Log("Info", "Faces", $"Авто-распознавание завершено! Нейросеть нашла и привязала {matched} новых фото к добавленным людям.");
-        System.Windows.MessageBox.Show($"Нейросеть успешно распознала и привязала {matched} фото к членам семьи и друзьям по всему архиву!", "Авто-распознавание", MessageBoxButton.OK, MessageBoxImage.Information);
+        _auditLogger.Log("Info", "Faces", $"Обучение и авто-распознавание завершено! Найдено и привязано {matched} новых фото с добавлением имен в теги.");
+        System.Windows.MessageBox.Show($"Нейросеть обучилась на ваших образцах и успешно привязала {matched} фото по всему архиву!\nИмена людей автоматически добавлены в теги фотографий.", "Обучение и распознавание", MessageBoxButton.OK, MessageBoxImage.Information);
 
         RefreshFaceStats();
         await LoadUnassignedFacesAsync();
         LoadPhotosForSelectedPerson(SelectedPerson);
+    }
+
+    [RelayCommand]
+    private async Task SyncPersonTagsAsync()
+    {
+        StatusText = "⏳ Синхронизация тегов людей с фотографиями...";
+        int count = await _faceService.SyncPersonNamesToMediaTagsAsync();
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+        _auditLogger.Log("Info", "Faces", $"Теги людей обновлены на {count} фотографиях.");
+        System.Windows.MessageBox.Show($"Имена людей успешно прописаны в теги на {count} фотографиях!", "Теги фотографий", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    [RelayCommand]
+    private async Task RecomputeEmbeddingsAsync()
+    {
+        if (System.Windows.MessageBox.Show("Обновить нейросетевые отпечатки лиц SFace для всех найденных фото? Это займет 1-2 минуты и кардинально повысит точность распознавания.", "Обновление нейросети", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+
+        StatusText = "⏳ Обновление нейросетевых отпечатков SFace...";
+        var progress = new Progress<(int processed, int total)>(p =>
+        {
+            FaceIndexingProgress = p.total > 0 ? (double)p.processed / p.total * 100 : 0;
+            FaceIndexingStatusText = $"Вычислено отпечатков SFace: {p.processed} из {p.total}";
+        });
+
+        int count = await _faceService.RecomputeAllEmbeddingsAsync(progress);
+        StatusText = IsBotRunning ? "🟢 Сервер запущен и принимает запросы" : "Сервер остановлен";
+        FaceIndexingStatusText = $"Готово! Обновлено {count} нейросетевых отпечатков.";
+        _auditLogger.Log("Info", "Faces", $"Обновлено {count} нейросетевых отпечатков SFace.");
+        System.Windows.MessageBox.Show($"Успешно обновлено {count} нейросетевых отпечатков SFace! Теперь нейросеть готова к точному распознаванию.", "Нейросеть SFace", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     [RelayCommand]
@@ -628,7 +670,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             await _faceService.AssignFaceToPersonAsync(item.FaceId, personId);
-            _auditLogger.Log("Info", "Faces", $"Лицо на фото '{item.FileName}' привязано к '{personName}'.");
+            _auditLogger.Log("Info", "Faces", $"Лицо на фото '{item.FileName}' привязано к '{personName}' (добавлено в обучающую выборку).");
 
             UnassignedFaces.Remove(item);
             RefreshFaceStats();
@@ -684,16 +726,7 @@ public partial class MainViewModel : ObservableObject
             var personId = SelectedPerson.Id;
             var personName = SelectedPerson.Name;
 
-            using var db = new AppDbContext();
-            var faces = await db.PersonFaces
-                .Where(f => f.MediaItemId == photoItem.MediaItemId && f.PersonId == personId)
-                .ToListAsync();
-
-            foreach (var f in faces)
-            {
-                f.PersonId = null;
-            }
-            await db.SaveChangesAsync();
+            await _faceService.UnassignPhotoFromPersonAsync(photoItem.MediaItemId, personId);
 
             _auditLogger.Log("Info", "Faces", $"Фото '{photoItem.FileName}' успешно отвязано от '{personName}'.");
 

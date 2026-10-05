@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using TrufaBot.Application.Interfaces;
 using TrufaBot.Domain.Entities;
 using TrufaBot.Infrastructure.Data;
@@ -102,21 +102,31 @@ public class AiIndexingService
                     // Создаем оптимизированную миниатюру 600x600 для быстрой передачи в ИИ
                     var thumbPath = await _thumbnailService.GetOrCreateThumbnailAsync(fullPath, 600, 600);
                     
-                    // 1. Распознаем лица на фото
+                    // 1. Извлекаем имена людей, уже привязанных к этой фотографии
+                    var assignedPersonNames = item.Faces
+                        .Where(f => f.Person != null && !f.IsIgnored)
+                        .Select(f => f.Person!.Name)
+                        .ToList();
+
+                    // Распознаем лица на фото
                     var detectedFaces = await _faceService.DetectAndRecognizeFacesAsync(thumbPath, ct);
                     var recognizedPersonNames = detectedFaces
                         .Where(f => !string.IsNullOrEmpty(f.MatchedPersonName))
                         .Select(f => f.MatchedPersonName!)
-                        .Distinct()
+                        .ToList();
+
+                    var allPersonNames = assignedPersonNames
+                        .Concat(recognizedPersonNames)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
                         .ToList();
 
                     // 2. Отправляем в Qwen2.5-VL / LM Studio с контекстом распознанных лиц!
                     var (description, tags) = await _aiVisionService.AnalyzePhotoAsync(thumbPath, serverUrl, modelName, ct);
 
-                    // Если распознаны конкретные люди, обогащаем теги и описание
-                    if (recognizedPersonNames.Any())
+                    // Если на фото есть конкретные люди, обогащаем теги их именами
+                    if (allPersonNames.Any())
                     {
-                        var peopleTags = string.Join(", ", recognizedPersonNames);
+                        var peopleTags = string.Join(", ", allPersonNames);
                         tags = string.IsNullOrEmpty(tags) ? peopleTags : $"{peopleTags}, {tags}";
                     }
 
