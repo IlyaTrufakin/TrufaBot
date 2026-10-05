@@ -432,6 +432,7 @@ public class FaceRecognitionService : IFaceRecognitionService
 
         targetFace.PersonId = personId;
         targetFace.IsIgnored = false;
+        targetFace.IsFalsePositive = false;
 
         // Если у этого лица был старый черновой вектор, вычисляем настоящий глубокий отпечаток SFace
         var curVec = DecodeEmbedding(targetFace.Embedding ?? "");
@@ -497,7 +498,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         var knownFaces = await db.PersonFaces
             .Include(f => f.MediaItem)
             .ThenInclude(m => m.StorageSource)
-            .Where(f => f.PersonId != null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
+            .Where(f => f.PersonId != null && !f.IsIgnored && !f.IsFalsePositive && !string.IsNullOrEmpty(f.Embedding))
             .ToListAsync(ct);
 
         if (!knownFaces.Any()) return 0;
@@ -544,7 +545,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         var unassignedFaces = await db.PersonFaces
             .Include(f => f.MediaItem)
             .ThenInclude(m => m.StorageSource)
-            .Where(f => f.PersonId == null && !f.IsIgnored && !string.IsNullOrEmpty(f.Embedding))
+            .Where(f => f.PersonId == null && !f.IsIgnored && !f.IsFalsePositive && !string.IsNullOrEmpty(f.Embedding))
             .ToListAsync(ct);
 
         int matchedCount = 0;
@@ -677,7 +678,7 @@ public class FaceRecognitionService : IFaceRecognitionService
         var faces = await db.PersonFaces
             .Include(f => f.MediaItem)
             .ThenInclude(m => m.StorageSource)
-            .Where(f => !f.IsIgnored)
+            .Where(f => !f.IsIgnored && !f.IsFalsePositive)
             .ToListAsync(ct);
 
         int total = faces.Count;
@@ -727,6 +728,33 @@ public class FaceRecognitionService : IFaceRecognitionService
         if (targetFace != null)
         {
             targetFace.IsIgnored = true;
+            targetFace.IsFalsePositive = false;
+            targetFace.PersonId = null;
+            await db.SaveChangesAsync(ct);
+        }
+    }
+
+    public async Task MarkFalsePositiveAsync(long faceId, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
+        if (targetFace != null)
+        {
+            targetFace.IsFalsePositive = true;
+            targetFace.IsIgnored = false;
+            targetFace.PersonId = null;
+            await db.SaveChangesAsync(ct);
+        }
+    }
+
+    public async Task RestoreFaceAsync(long faceId, CancellationToken ct = default)
+    {
+        using var db = new AppDbContext();
+        var targetFace = await db.PersonFaces.FindAsync(new object[] { faceId }, ct);
+        if (targetFace != null)
+        {
+            targetFace.IsIgnored = false;
+            targetFace.IsFalsePositive = false;
             targetFace.PersonId = null;
             await db.SaveChangesAsync(ct);
         }

@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using TrufaBot.Domain.Entities;
 using TrufaBot.Infrastructure.Common;
 
@@ -157,6 +157,13 @@ public class AppDbContext : DbContext
                 using var alterFaceCmd = db.Database.GetDbConnection().CreateCommand();
                 alterFaceCmd.CommandText = "ALTER TABLE PersonFaces ADD COLUMN IsIgnored INTEGER NOT NULL DEFAULT 0;";
                 alterFaceCmd.ExecuteNonQuery();
+            }
+
+            if (!existingFaceCols.Contains("IsFalsePositive"))
+            {
+                using var alterFalseCmd = db.Database.GetDbConnection().CreateCommand();
+                alterFalseCmd.CommandText = "ALTER TABLE PersonFaces ADD COLUMN IsFalsePositive INTEGER NOT NULL DEFAULT 0;";
+                alterFalseCmd.ExecuteNonQuery();
             }
 
             // Очищаем любые недопустимые PersonId <= 0 если они были записаны

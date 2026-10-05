@@ -25,6 +25,8 @@ public interface IFaceRecognitionService
     Task<int> SyncPersonNamesToMediaTagsAsync(CancellationToken ct = default);
     Task<int> RecomputeAllEmbeddingsAsync(IProgress<(int processed, int total)>? progress = null, CancellationToken ct = default);
     Task IgnoreFaceAsync(long faceId, CancellationToken ct = default);
+    Task MarkFalsePositiveAsync(long faceId, CancellationToken ct = default);
+    Task RestoreFaceAsync(long faceId, CancellationToken ct = default);
     Task DeleteFaceAsync(long faceId, CancellationToken ct = default);
     Task ResetAllAssignmentsAsync(CancellationToken ct = default);
     Task ClearAllFacesAndResetAsync(CancellationToken ct = default);

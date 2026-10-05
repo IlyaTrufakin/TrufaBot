@@ -1,4 +1,4 @@
-﻿namespace TrufaBot.Domain.Entities;
+namespace TrufaBot.Domain.Entities;
 
 public class PersonFace
 {
@@ -19,6 +19,7 @@ public class PersonFace
     public float Confidence { get; set; }
 
     public bool IsIgnored { get; set; } = false;
+    public bool IsFalsePositive { get; set; } = false;
 
     public DateTime DetectedAt { get; set; } = DateTime.UtcNow;
 }

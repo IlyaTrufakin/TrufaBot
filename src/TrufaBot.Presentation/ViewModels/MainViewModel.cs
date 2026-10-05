@@ -47,6 +47,13 @@ public partial class PersonItemViewModel : ObservableObject
     public DateTime CreatedAt { get; set; }
 }
 
+public enum FaceQueueFilter
+{
+    Unassigned,
+    Ignored,
+    FalseFaces
+}
+
 public partial class UnassignedFaceItemViewModel : ObservableObject
 {
     public long FaceId { get; set; }
@@ -57,6 +64,28 @@ public partial class UnassignedFaceItemViewModel : ObservableObject
 
     [ObservableProperty]
     private PersonItemViewModel? _selectedPerson;
+
+    [ObservableProperty]
+    private bool _hasSuggestion;
+
+    [ObservableProperty]
+    private string _suggestedPersonName = "";
+
+    [ObservableProperty]
+    private int _suggestedSimilarityPercent;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRestore))]
+    [NotifyPropertyChangedFor(nameof(CanIgnoreOrDelete))]
+    private bool _isIgnored;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRestore))]
+    [NotifyPropertyChangedFor(nameof(CanIgnoreOrDelete))]
+    private bool _isFalsePositive;
+
+    public bool CanRestore => IsIgnored || IsFalsePositive;
+    public bool CanIgnoreOrDelete => !IsIgnored && !IsFalsePositive;
 }
 
 public partial class PersonPhotoItemViewModel : ObservableObject
@@ -209,6 +238,39 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private int _totalKnownFacesCount;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsFilterUnassigned))]
+    [NotifyPropertyChangedFor(nameof(IsFilterIgnored))]
+    [NotifyPropertyChangedFor(nameof(IsFilterFalseFaces))]
+    [NotifyPropertyChangedFor(nameof(CurrentFilterTitle))]
+    private FaceQueueFilter _currentFaceFilter = FaceQueueFilter.Unassigned;
+
+    public bool IsFilterUnassigned => CurrentFaceFilter == FaceQueueFilter.Unassigned;
+    public bool IsFilterIgnored => CurrentFaceFilter == FaceQueueFilter.Ignored;
+    public bool IsFilterFalseFaces => CurrentFaceFilter == FaceQueueFilter.FalseFaces;
+
+    public string CurrentFilterTitle => CurrentFaceFilter switch
+    {
+        FaceQueueFilter.Ignored => "👤 Другие лица (скрытые / вне списка):",
+        FaceQueueFilter.FalseFaces => "❌ Ложные детекции (не лица):",
+        _ => "🏷 Неразмеченные лица (очередь обучения):"
+    };
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(RandomModeButtonText))]
+    private bool _isRandomSampleMode = true;
+
+    public string RandomModeButtonText => IsRandomSampleMode ? "🎲 Случайно: ВКЛ" : "🕒 По порядку: ВКЛ";
+
+    [ObservableProperty]
+    private int _unassignedCount;
+
+    [ObservableProperty]
+    private int _ignoredFacesCount;
+
+    [ObservableProperty]
+    private int _falseFacesCount;
 
     [ObservableProperty]
     private ObservableCollection<UnassignedFaceItemViewModel> _unassignedFaces = new();
@@ -429,19 +491,22 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 using var db = new AppDbContext();
-                var totalFaces = await db.PersonFaces.CountAsync(f => !f.IsIgnored);
+                var totalFaces = await db.PersonFaces.CountAsync(f => !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+                var unassignedCount = await db.PersonFaces.CountAsync(f => f.PersonId == null && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+                var ignoredCount = await db.PersonFaces.CountAsync(f => f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+                var falseCount = await db.PersonFaces.CountAsync(f => f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
                 var peopleList = await db.People.OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync();
 
                 // Считаем уникальные фотографии для каждого человека
                 var distinctCounts = await db.PersonFaces
-                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
                     .GroupBy(f => f.PersonId!.Value)
                     .Select(g => new { PersonId = g.Key, Count = g.Select(x => x.MediaItemId).Distinct().Count() })
                     .ToDictionaryAsync(x => x.PersonId, x => x.Count);
 
                 // Считаем подтвержденные образцы лиц (обучающую выборку) для каждого человека
                 var sampleCounts = await db.PersonFaces
-                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
+                    .Where(f => f.PersonId != null && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
                     .GroupBy(f => f.PersonId!.Value)
                     .Select(g => new { PersonId = g.Key, Count = g.Count() })
                     .ToDictionaryAsync(x => x.PersonId, x => x.Count);
@@ -449,6 +514,9 @@ public partial class MainViewModel : ObservableObject
                 System.Windows.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     TotalKnownFacesCount = totalFaces;
+                    UnassignedCount = unassignedCount;
+                    IgnoredFacesCount = ignoredCount;
+                    FalseFacesCount = falseCount;
                     var currentSelectedId = SelectedPerson?.Id;
 
                     var dict = peopleList.ToDictionary(p => p.Id);
@@ -515,19 +583,115 @@ public partial class MainViewModel : ObservableObject
         try
         {
             using var db = new AppDbContext();
-            var unassigned = await db.PersonFaces
+
+            // 1. Считаем количество в каждой категории
+            var unassignedCount = await db.PersonFaces
+                .CountAsync(f => f.PersonId == null && !f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+            var ignoredCount = await db.PersonFaces
+                .CountAsync(f => f.IsIgnored && !f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+            var falseCount = await db.PersonFaces
+                .CountAsync(f => f.IsFalsePositive && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+
+            UnassignedCount = unassignedCount;
+            IgnoredFacesCount = ignoredCount;
+            FalseFacesCount = falseCount;
+
+            // 2. Формируем запрос в зависимости от текущего фильтра
+            var query = db.PersonFaces
                 .Include(f => f.MediaItem)
                 .ThenInclude(m => m.StorageSource)
-                .Where(f => f.PersonId == null && !f.IsIgnored && !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled)
-                .OrderByDescending(f => f.Id)
-                .Take(12)
+                .Where(f => !f.MediaItem.IsDeleted && f.MediaItem.StorageSource.IsEnabled);
+
+            if (CurrentFaceFilter == FaceQueueFilter.Ignored)
+            {
+                query = query.Where(f => f.IsIgnored && !f.IsFalsePositive);
+            }
+            else if (CurrentFaceFilter == FaceQueueFilter.FalseFaces)
+            {
+                query = query.Where(f => f.IsFalsePositive);
+            }
+            else
+            {
+                query = query.Where(f => f.PersonId == null && !f.IsIgnored && !f.IsFalsePositive);
+            }
+
+            // 3. Выборка: случайная для разнообразия обучения или по порядку
+            List<PersonFace> faces;
+            const int pageSize = 14;
+
+            if (IsRandomSampleMode)
+            {
+                faces = await query
+                    .OrderBy(f => EF.Functions.Random())
+                    .Take(pageSize)
+                    .ToListAsync();
+            }
+            else
+            {
+                faces = await query
+                    .OrderByDescending(f => f.Id)
+                    .Take(pageSize)
+                    .ToListAsync();
+            }
+
+            // 4. Загружаем эталонные векторы добавленных людей для умного авто-предложения в выпадающем списке
+            var knownFaces = await db.PersonFaces
+                .Where(f => f.PersonId != null && !f.IsIgnored && !f.IsFalsePositive && !string.IsNullOrEmpty(f.Embedding))
                 .ToListAsync();
 
+            var prototypes = new Dictionary<int, List<float[]>>();
+            foreach (var kf in knownFaces)
+            {
+                var vec = FaceRecognitionService.DecodeEmbedding(kf.Embedding!);
+                if (vec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(vec))
+                {
+                    if (!prototypes.ContainsKey(kf.PersonId!.Value))
+                        prototypes[kf.PersonId!.Value] = new List<float[]>();
+                    prototypes[kf.PersonId!.Value].Add(vec);
+                }
+            }
+
             var list = new List<UnassignedFaceItemViewModel>();
-            foreach (var face in unassigned)
+
+            foreach (var face in faces)
             {
                 var fullPath = Path.Combine(face.MediaItem.StorageSource.RootPath, face.MediaItem.RelativePath.Replace('/', '\\'));
                 var cropPath = await _faceService.GetOrCreateFaceCropThumbnailAsync(fullPath, face.BoxX, face.BoxY, face.BoxWidth, face.BoxHeight, face.Id);
+
+                PersonItemViewModel? suggestedPerson = null;
+                bool hasSuggestion = false;
+                int simPercent = 0;
+
+                // Умная подсказка: проверяем сходство лица с уже размеченными людьми
+                var faceVec = FaceRecognitionService.DecodeEmbedding(face.Embedding ?? "");
+                if (faceVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(faceVec) && prototypes.Any())
+                {
+                    int? bestId = null;
+                    double bestSim = 0.0;
+                    foreach (var (pId, vecs) in prototypes)
+                    {
+                        foreach (var v in vecs)
+                        {
+                            var sim = FaceRecognitionService.CalculateCosineSimilarity(faceVec, v);
+                            if (sim > bestSim)
+                            {
+                                bestSim = sim;
+                                bestId = pId;
+                            }
+                        }
+                    }
+
+                    // Если сходство >= 0.35, выставляем подсказку в выпадающий список
+                    if (bestId.HasValue && bestSim >= 0.35)
+                    {
+                        suggestedPerson = People.FirstOrDefault(p => p.Id == bestId.Value);
+                        if (suggestedPerson != null)
+                        {
+                            hasSuggestion = true;
+                            simPercent = (int)(bestSim * 100);
+                        }
+                    }
+                }
 
                 list.Add(new UnassignedFaceItemViewModel
                 {
@@ -536,7 +700,12 @@ public partial class MainViewModel : ObservableObject
                     FileName = face.MediaItem.FileName,
                     FullImagePath = fullPath,
                     CropThumbnailPath = cropPath,
-                    SelectedPerson = null
+                    SelectedPerson = suggestedPerson,
+                    HasSuggestion = hasSuggestion,
+                    SuggestedPersonName = suggestedPerson?.Name ?? "",
+                    SuggestedSimilarityPercent = simPercent,
+                    IsIgnored = face.IsIgnored,
+                    IsFalsePositive = face.IsFalsePositive
                 });
             }
 
@@ -552,6 +721,52 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _auditLogger.Log("Error", "Faces", $"Ошибка загрузки лиц: {ex.Message}");
+        }
+    }
+
+    [RelayCommand]
+    private async Task SetFilterUnassignedAsync()
+    {
+        CurrentFaceFilter = FaceQueueFilter.Unassigned;
+        await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task SetFilterIgnoredAsync()
+    {
+        CurrentFaceFilter = FaceQueueFilter.Ignored;
+        await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task SetFilterFalseFacesAsync()
+    {
+        CurrentFaceFilter = FaceQueueFilter.FalseFaces;
+        await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task ToggleRandomSampleModeAsync()
+    {
+        IsRandomSampleMode = !IsRandomSampleMode;
+        await LoadUnassignedFacesAsync();
+    }
+
+    [RelayCommand]
+    private async Task RestoreFaceAsync(UnassignedFaceItemViewModel? item)
+    {
+        if (item == null) return;
+        try
+        {
+            await _faceService.RestoreFaceAsync(item.FaceId);
+            _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' возвращено в список неразмеченных.");
+            UnassignedFaces.Remove(item);
+            RefreshFaceStats();
+            await LoadUnassignedFacesAsync();
+        }
+        catch (Exception ex)
+        {
+            _auditLogger.Log("Error", "Faces", $"Ошибка восстановления лица: {ex.Message}");
         }
     }
 
@@ -673,6 +888,33 @@ public partial class MainViewModel : ObservableObject
             _auditLogger.Log("Info", "Faces", $"Лицо на фото '{item.FileName}' привязано к '{personName}' (добавлено в обучающую выборку).");
 
             UnassignedFaces.Remove(item);
+
+            // Авто-распространение подсказки: если среди оставшихся на экране лиц есть очень похожие на только что подтвержденное, сразу предвыбираем этого же человека!
+            using (var db = new AppDbContext())
+            {
+                var assignedFace = await db.PersonFaces.FindAsync(item.FaceId);
+                var assignedVec = FaceRecognitionService.DecodeEmbedding(assignedFace?.Embedding ?? "");
+                if (assignedVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(assignedVec))
+                {
+                    foreach (var other in UnassignedFaces.Where(o => o.SelectedPerson == null || !o.HasSuggestion))
+                    {
+                        var otherFace = await db.PersonFaces.FindAsync(other.FaceId);
+                        var otherVec = FaceRecognitionService.DecodeEmbedding(otherFace?.Embedding ?? "");
+                        if (otherVec != null && !FaceRecognitionService.IsLegacyDummyEmbedding(otherVec))
+                        {
+                            var sim = FaceRecognitionService.CalculateCosineSimilarity(assignedVec, otherVec);
+                            if (sim >= 0.35)
+                            {
+                                other.SelectedPerson = People.FirstOrDefault(p => p.Id == personId);
+                                other.HasSuggestion = true;
+                                other.SuggestedPersonName = personName;
+                                other.SuggestedSimilarityPercent = (int)(sim * 100);
+                            }
+                        }
+                    }
+                }
+            }
+
             RefreshFaceStats();
             LoadPhotosForSelectedPerson(SelectedPerson);
         }
@@ -689,7 +931,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             await _faceService.IgnoreFaceAsync(item.FaceId);
-            _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто).");
+            _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как незнакомец (скрыто в отдельный список).");
             UnassignedFaces.Remove(item);
             RefreshFaceStats();
         }
@@ -705,8 +947,8 @@ public partial class MainViewModel : ObservableObject
         if (item == null) return;
         try
         {
-            await _faceService.DeleteFaceAsync(item.FaceId);
-            _auditLogger.Log("Info", "Faces", $"Удалено ошибочное распознавание лица на '{item.FileName}'.");
+            await _faceService.MarkFalsePositiveAsync(item.FaceId);
+            _auditLogger.Log("Info", "Faces", $"Лицо на '{item.FileName}' помечено как ложная детекция (скрыто в отдельный список).");
             UnassignedFaces.Remove(item);
             RefreshFaceStats();
         }
