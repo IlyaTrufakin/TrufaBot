@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -52,7 +52,12 @@ public class TelegramBotService
     private readonly IThumbnailService _thumbnailService;
     private readonly ConcurrentDictionary<long, UserBrowseState> _userSessions = new();
     private ITelegramBotClient? _botClient;
+    private HttpClient? _httpClient;
     private CancellationTokenSource? _cts;
+
+    private DateTime _lastTransientErrorLogTime = DateTime.MinValue;
+    private int _transientErrorCount = 0;
+    private bool _isReconnecting = false;
 
     public bool IsRunning => _botClient != null && _cts != null && !_cts.IsCancellationRequested;
 
@@ -68,7 +73,23 @@ public class TelegramBotService
         if (IsRunning) return;
 
         _cts = new CancellationTokenSource();
-        _botClient = new TelegramBotClient(token);
+        _isReconnecting = false;
+        _transientErrorCount = 0;
+        _lastTransientErrorLogTime = DateTime.MinValue;
+
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            ConnectTimeout = TimeSpan.FromSeconds(20),
+            KeepAlivePingDelay = TimeSpan.FromSeconds(30),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
+            EnableMultipleHttp2Connections = true
+        };
+        _httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+        _botClient = new TelegramBotClient(token, _httpClient);
 
         var receiverOptions = new ReceiverOptions
         {
@@ -98,6 +119,8 @@ public class TelegramBotService
     {
         _cts?.Cancel();
         _botClient = null;
+        try { _httpClient?.Dispose(); } catch { }
+        _httpClient = null;
         _logger.Log("Info", "Telegram", "Telegram бот остановлен.");
     }
 
@@ -140,6 +163,20 @@ public class TelegramBotService
 
     private async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
     {
+        if (_isReconnecting)
+        {
+            _isReconnecting = false;
+            if (_transientErrorCount > 1)
+            {
+                _logger.Log("Info", "Telegram", $"Связь с серверами Telegram восстановлена (автоматически преодолено временных сбоев: {_transientErrorCount}).");
+            }
+            else
+            {
+                _logger.Log("Info", "Telegram", "Связь с серверами Telegram восстановлена.");
+            }
+            _transientErrorCount = 0;
+        }
+
         try
         {
             long userId = update.Message?.From?.Id ?? update.CallbackQuery?.From.Id ?? 0;
@@ -168,6 +205,18 @@ public class TelegramBotService
             {
                 await HandleCallbackQueryAsync(bot, update.CallbackQuery, user, db, ct);
             }
+        }
+        catch (ApiRequestException apiEx) when (apiEx.ErrorCode is 500 or 502 or 503 or 504)
+        {
+            _logger.Log("Warning", "Telegram", $"Временная задержка шлюза Telegram при ответе [{apiEx.ErrorCode}]: {apiEx.Message}. Пользователь может повторить запрос.");
+        }
+        catch (HttpRequestException httpEx)
+        {
+            _logger.Log("Warning", "Telegram", $"Временный сетевой сбой при связи с Telegram: {httpEx.Message}.");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested || (_cts != null && _cts.IsCancellationRequested))
+        {
+            // Normal shutdown cancellation, ignore
         }
         catch (Exception ex)
         {
@@ -1067,14 +1116,93 @@ public class TelegramBotService
 
     private Task HandleErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken ct)
     {
-        var errorMsg = exception is ApiRequestException apiEx
-            ? $"Telegram API Error [{apiEx.ErrorCode}]: {apiEx.Message}"
-            : exception.Message;
-
-        if (!errorMsg.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+        // 1. Игнорируем штатную отмену при остановке бота пользователем
+        if (ct.IsCancellationRequested || (_cts != null && _cts.IsCancellationRequested))
         {
-            _logger.Log("Error", "Telegram", errorMsg);
+            return Task.CompletedTask;
         }
+
+        // 2. Обработка ошибок Telegram Bot API
+        if (exception is ApiRequestException apiEx)
+        {
+            // Временные сетевые сбои на стороне облака Telegram (шлюзы NGINX/Cloudflare/балансировщики)
+            if (apiEx.ErrorCode is 500 or 502 or 503 or 504)
+            {
+                _transientErrorCount++;
+                var now = DateTime.UtcNow;
+                if (!_isReconnecting || (now - _lastTransientErrorLogTime) >= TimeSpan.FromMinutes(5))
+                {
+                    _isReconnecting = true;
+                    _lastTransientErrorLogTime = now;
+                    string gatewayReason = apiEx.ErrorCode switch
+                    {
+                        502 => "Временная недоступность внешнего шлюза Telegram [502 Bad Gateway]",
+                        503 => "Сервис Telegram временно перегружен [503 Service Unavailable]",
+                        504 => "Таймаут внешнего шлюза Telegram [504 Gateway Timeout]",
+                        _ => $"Временная ошибка серверов Telegram [{apiEx.ErrorCode}]"
+                    };
+                    _logger.Log("Warning", "Telegram", $"{gatewayReason}. Бот автоматически возобновляет опрос в фоновом режиме (штатное поведение API Telegram).");
+                }
+                return Task.CompletedTask;
+            }
+
+            if (apiEx.ErrorCode == 429)
+            {
+                _logger.Log("Warning", "Telegram", $"Превышен лимит запросов Telegram API (429 Too Many Requests): {apiEx.Message}. Ожидание автоматического сброса лимита.");
+                return Task.CompletedTask;
+            }
+
+            if (apiEx.ErrorCode == 401)
+            {
+                _logger.Log("Error", "Telegram", "Критическая ошибка: Неверный токен Telegram бота (401 Unauthorized). Проверьте токен в настройках.");
+                return Task.CompletedTask;
+            }
+
+            if (apiEx.ErrorCode == 409)
+            {
+                _logger.Log("Error", "Telegram", "Конфликт подключений (409 Conflict): запущена еще одна копия бота с этим токеном или активен Webhook.");
+                return Task.CompletedTask;
+            }
+
+            if (apiEx.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.CompletedTask;
+            }
+
+            _logger.Log("Error", "Telegram", $"Telegram API Error [{apiEx.ErrorCode}]: {apiEx.Message}");
+            return Task.CompletedTask;
+        }
+
+        // 3. Временные сетевые сбои (DNS, обрыв сокета, потеря пакетов интернет-провайдера)
+        if (exception is HttpRequestException httpEx)
+        {
+            _transientErrorCount++;
+            var now = DateTime.UtcNow;
+            if (!_isReconnecting || (now - _lastTransientErrorLogTime) >= TimeSpan.FromMinutes(5))
+            {
+                _isReconnecting = true;
+                _lastTransientErrorLogTime = now;
+                _logger.Log("Warning", "Telegram", $"Временный сетевой сбой связи с серверами Telegram ({httpEx.Message}). Бот автоматически повторяет подключение.");
+            }
+            return Task.CompletedTask;
+        }
+
+        // 4. Сетевой таймаут HTTP соединения во время long-polling
+        if (exception is TimeoutException or TaskCanceledException or OperationCanceledException)
+        {
+            _transientErrorCount++;
+            var now = DateTime.UtcNow;
+            if (!_isReconnecting || (now - _lastTransientErrorLogTime) >= TimeSpan.FromMinutes(5))
+            {
+                _isReconnecting = true;
+                _lastTransientErrorLogTime = now;
+                _logger.Log("Warning", "Telegram", "Таймаут соединения с серверами Telegram. Повторный опрос продолжается автоматически.");
+            }
+            return Task.CompletedTask;
+        }
+
+        // 5. Прочие непредвиденные ошибки
+        _logger.Log("Error", "Telegram", $"Ошибка Telegram: {exception.Message}");
         return Task.CompletedTask;
     }
 }
